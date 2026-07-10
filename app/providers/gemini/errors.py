@@ -12,6 +12,12 @@ _AUTH_MARKERS = (
     "api key not valid",
     "api_key_invalid",
 )
+# A 403 on an uploaded File API ref ("You do not have permission to access the
+# File ... or it may not exist") is NOT a dead key — it means the file was
+# uploaded under a different key/project or has expired. Must be caught before
+# _AUTH_MARKERS' "permission_denied", otherwise it dead-cools a healthy key for
+# an hour and cascades the whole pool. Retryable via re-upload, no cooldown.
+_STALE_MEDIA_RE = re.compile(r"permission to access the file|file .*may not exist")
 _QUOTA_MARKERS = ("daily", "project quota", "daily quota")
 _NOT_FOUND_RE = re.compile(r"\b404\b|not_found|not found")
 _RATE_LIMIT_RE = re.compile(
@@ -26,6 +32,9 @@ def classify_gemini_error(error: str) -> FailureClassification:
     merged into the single seam a Provider is responsible for.
     """
     message = str(error).lower()
+
+    if _STALE_MEDIA_RE.search(message):
+        return FailureClassification(reason=FailureReason.STALE_MEDIA, scope="key_model", retryable=True)
 
     if any(marker in message for marker in _AUTH_MARKERS):
         return FailureClassification(reason=FailureReason.AUTH_DEAD, scope="key", retryable=True)

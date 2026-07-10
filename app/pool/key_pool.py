@@ -402,6 +402,10 @@ class AsyncAPIKeyPool:
         kid = key_id(api_key)
         now = time.time()
 
+        if classification.reason == FailureReason.STALE_MEDIA:
+            # Cross-key/expired File API ref, not a key health problem — never cool.
+            return
+
         if classification.reason == FailureReason.AUTH_DEAD:
             await self.mark_cooldown(api_key, self.settings.dead_cooldown_seconds, FailureReason.AUTH_DEAD.value)
             return

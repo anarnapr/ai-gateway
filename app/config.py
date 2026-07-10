@@ -13,7 +13,9 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     redis_key_prefix: str = "aiservice"
 
-    max_in_flight: int = 4
+    # Key leases are per-key-exclusive (SET NX leased:{kid}), so the useful ceiling is
+    # the key count — with 27 keys, 27 means "the whole pool may be busy at once".
+    max_in_flight: int = 27
     default_rpm: int = 15
 
     rate_limit_min_interval_seconds: float = 5.0
@@ -37,6 +39,40 @@ class Settings(BaseSettings):
     # HTTP request should fail fast with retry guidance rather than hold the connection
     # open for a potentially 30+ minute backoff.
     acquire_key_max_wait_seconds: float = 10.0
+
+    # Server-side generate timeout applied when the caller does NOT send its own
+    # timeout_seconds. Without this, a hung/slow SDK call never raises, so the retry
+    # loop never rotates to another key — the request just blocks until the client's
+    # socket read-timeout kills it. A timeout turns "stuck on key A" into "fail fast,
+    # rotate to key B".
+    default_generate_timeout_seconds: float = 90.0
+
+    # Total wall-clock budget for one /generate request across all internal retries.
+    # The handler stops retrying and returns 429 (with Retry-After) once this is hit,
+    # so the gateway responds before the caller's HTTP read-timeout fires. Keep this
+    # below the client's http timeout (client uses (timeout or 120)+30 = 150s).
+    request_deadline_seconds: float = 120.0
+
+    # --- Batch jobs API (app/jobs/) ---
+    # Async queue: POST /v1/jobs enqueues items in Redis, an in-process asyncio worker
+    # pool drains them through run_generate, clients poll GET /v1/jobs/{batch_id}.
+    jobs_worker_concurrency: int = 20  # <= max_in_flight; leaves headroom for sync callers
+    jobs_poll_interval_seconds: float = 1.0  # idle-queue poll interval
+    # Per-attempt wall clock for one job item. Wider than request_deadline_seconds:
+    # a reel is a ~50MB upload + a 60-125s generate and has no HTTP client waiting.
+    jobs_item_deadline_seconds: float = 300.0
+    jobs_item_max_attempts: int = 3  # job-level retries for real generate failures
+    jobs_capacity_max_retries: int = 10  # separate budget for pool-exhausted waits
+    jobs_retry_delay_seconds: float = 10.0
+    jobs_retry_max_delay_seconds: float = 60.0
+    # Must exceed worst-case item hold time (attempts * item deadline + retry sleeps),
+    # or the reaper steals items from live workers.
+    jobs_lease_ttl_seconds: float = 1200.0
+    jobs_reaper_interval_seconds: float = 60.0
+    jobs_result_ttl_seconds: int = 86_400  # finished batches readable for 24h
+    jobs_max_queue_length: int = 1000  # submit -> 429 + Retry-After beyond this
+    jobs_max_items_per_batch: int = 200
+    jobs_shutdown_grace_seconds: float = 5.0
 
     @property
     def clamped_dead_cooldown_seconds(self) -> float:

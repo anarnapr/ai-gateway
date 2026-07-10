@@ -38,3 +38,26 @@ def test_generate_retries_on_transient_error_then_succeeds(api_client, monkeypat
     assert resp.status_code == 200
     assert resp.json()["text"] == "ok on retry"
     assert resp.json()["attempts"] == 2
+
+
+def test_generate_default_timeout_applied_and_rotates_on_hang(api_client, monkeypatch):
+    """Caller sends no timeout_seconds -> a hung generate must still raise (via the
+    server default timeout) so the loop rotates to another key instead of blocking.
+    """
+    seen = {"timeouts": [], "n": 0}
+
+    async def hanging_then_ok(self, ctx):
+        seen["n"] += 1
+        seen["timeouts"].append(ctx.timeout_seconds)
+        if seen["n"] == 1:
+            raise TimeoutError("Gemini request timed out after 90.0s.")
+        return ProviderResult(text="ok after timeout", input_tokens=1, output_tokens=1, total_tokens=2)
+
+    monkeypatch.setattr(GeminiProvider, "generate", hanging_then_ok)
+
+    resp = api_client.post("/v1/generate", json={"prompt": "hi"})  # no timeout_seconds
+    assert resp.status_code == 200
+    assert resp.json()["text"] == "ok after timeout"
+    assert resp.json()["attempts"] == 2
+    # Server default timeout was injected (not None), so the SDK call is bounded.
+    assert all(t and t > 0 for t in seen["timeouts"])

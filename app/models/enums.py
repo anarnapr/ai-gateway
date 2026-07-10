@@ -19,4 +19,5 @@ class FailureReason(str, Enum):
     HIGH_DEMAND = "high_demand"
     NOT_FOUND = "not_found"
     SHORT_COOLDOWN = "short_cooldown"
+    STALE_MEDIA = "stale_media"
     UNKNOWN = "unknown"

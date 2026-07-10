@@ -45,6 +45,36 @@ class RedisKeys:
     def usage_rpd(self, kid: str, model: str, yyyymmdd: str) -> str:
         return f"{self.prefix}:usage:rpd:{kid}:{model}:{yyyymmdd}"
 
+    # --- Batch jobs API (async queue; see app/jobs/) ---
+
+    def jobs_queue(self) -> str:
+        """LIST of "{batch_id}:{item_id}" entries. LPUSH to produce, LMOVE RIGHT->LEFT
+        into jobs_processing() to consume (non-blocking; workers poll)."""
+        return f"{self.prefix}:jobs:queue"
+
+    def jobs_processing(self) -> str:
+        """LIST of entries currently held by a worker. Entries without a live lease
+        are requeued by the reaper."""
+        return f"{self.prefix}:jobs:processing"
+
+    def jobs_lease(self, batch_id: str, item_id: str) -> str:
+        """STRING with TTL — liveness marker for an in-flight item."""
+        return f"{self.prefix}:jobs:lease:{batch_id}:{item_id}"
+
+    def jobs_batch(self, batch_id: str) -> str:
+        """HASH: status/total/provider/created_at/finished_at + HINCRBY counters
+        (queued/awaiting_media/running/succeeded/failed)."""
+        return f"{self.prefix}:jobs:batch:{batch_id}"
+
+    def jobs_batch_items(self, batch_id: str) -> str:
+        """LIST of item_ids in submit order."""
+        return f"{self.prefix}:jobs:batch_items:{batch_id}"
+
+    def jobs_item(self, batch_id: str, item_id: str) -> str:
+        """HASH: status, request (GenerateRequest JSON), metadata JSON, media_path,
+        attempts, capacity_retries, result fields, error, error_code, timestamps."""
+        return f"{self.prefix}:jobs:item:{batch_id}:{item_id}"
+
     # --- CallTracker (quota enforcement, keyed by key *suffix* not kid, mirroring
     # the original APICallTracker which only ever saw the last-4-char suffix) ---
 

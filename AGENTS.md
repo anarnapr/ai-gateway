@@ -34,6 +34,12 @@ curl localhost:8080/v1/pool/status
 curl localhost:8080/v1/keys
 curl localhost:8080/v1/usage/summary
 curl localhost:8080/health/ready
+
+# Batch jobs (async, parallel across the key pool — poll for results):
+curl -X POST localhost:8080/v1/jobs -H 'Content-Type: application/json' \
+  -d '{"items": [{"item_id": "a", "prompt": "one"}, {"item_id": "b", "prompt": "two", "has_media": true}]}'
+curl -X POST localhost:8080/v1/jobs/{batch_id}/items/b/media -F 'file=@reel.mp4'
+curl localhost:8080/v1/jobs/{batch_id}
 ```
 
 ## Project Structure
@@ -42,7 +48,8 @@ gemini/
 ├── app/
 │   ├── main.py                # FastAPI app, lifespan (redis/provider/pool wiring)
 │   ├── config.py               # env-var settings, hard 1h cooldown clamp
-│   ├── api/v1/                 # generate, pool, keys, usage, health routers
+│   ├── api/v1/                 # generate, jobs, pool, keys, usage, health routers
+│   ├── jobs/                    # batch jobs: JobStore (Redis queue/state) + JobWorkerPool
 │   ├── models/                 # pydantic request/response models, shared enums
 │   ├── providers/               # Provider ABC + registry + per-provider impls
 │   │   └── gemini/              # GeminiProvider: SDK calls + error classification
@@ -69,6 +76,14 @@ gemini/
   `Retry-After` HTTP header, every time.
 - **Keep `acquire_key()` bounded** (`ACQUIRE_KEY_MAX_WAIT_SECONDS`) — this is an HTTP
   service, not a batch job; don't hold connections open for long backoffs.
+- **Batch jobs rules** (`app/jobs/`): workers are asyncio tasks started/stopped in the
+  `app/main.py` lifespan (never FastAPI `BackgroundTasks`); they must reuse
+  `run_generate` from `app/api/v1/generate.py`, never a second pipeline. No blocking
+  Redis list ops (`BLPOP`/`BLMOVE`) — tests (fakeredis) and graceful shutdown depend on
+  the non-blocking `LMOVE` + poll design. `JobWorkerPool.stop()` runs before
+  `close_redis()`. Refresh the item lease before any retry sleep or the reaper steals
+  the item. Batch media under `UPLOADS_DIR/jobs/` is the one non-Redis piece of shared
+  state (host-local); delete only on terminal success/failure.
 - **New provider checklist**: implement `Provider` ABC (`app/providers/base.py`),
   register in `app/providers/registry.py`'s `_BUILDERS`, add a section to
   `config/models.yaml`, wire its key env var in `app/main.py`. Nothing else changes.

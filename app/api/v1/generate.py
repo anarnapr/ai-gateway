@@ -58,6 +58,7 @@ async def run_generate(
     usage_logger: UsageLogger,
     settings: Settings,
     media_path: Optional[str] = None,
+    deadline_seconds: Optional[float] = None,
 ) -> GenerateResponse:
     model = provider.resolve_model(req.model)
     max_retries = max(req.max_retries, pool.size() + 5)
@@ -67,46 +68,71 @@ async def run_generate(
     uploaded_ref = None
     uploaded_ref_key: Optional[str] = None
 
+    # Per-generate timeout: honor the caller's value, else fall back to the server
+    # default so a slow/hung SDK call raises (and the loop rotates keys) instead of
+    # blocking until the client socket dies.
+    effective_timeout = (
+        req.timeout_seconds
+        if (req.timeout_seconds and req.timeout_seconds > 0)
+        else settings.default_generate_timeout_seconds
+    )
+
     start_time = time.monotonic()
+    # Total wall-clock budget across all internal retries — respond 429 before the
+    # caller's HTTP read-timeout fires rather than holding the connection open.
+    # Job workers pass a wider deadline_seconds (no HTTP client is waiting there).
+    deadline = start_time + (deadline_seconds or settings.request_deadline_seconds)
 
     try:
         for attempt in range(max_retries):
             leased_key: Optional[str] = None
             attempt_model = model
 
+            if time.monotonic() >= deadline:
+                await _raise_pool_error(pool, request_id, provider.name)
+
             try:
-                if requires_upload and uploaded_ref is None:
-                    upload_key, upload_model = await pool.acquire_key(
-                        tracker=tracker,
-                        service=provider.name,
-                        method="upload",
-                        max_wait_seconds=settings.acquire_key_max_wait_seconds,
-                    )
-                    if not upload_key:
-                        await _raise_pool_error(pool, request_id, provider.name)
-                    leased_key = upload_key
-                    attempt_model = upload_model or model
+                acquire_wait = max(0.0, min(settings.acquire_key_max_wait_seconds, deadline - time.monotonic()))
+                key, key_model = await pool.acquire_key(
+                    tracker=tracker,
+                    service=provider.name,
+                    method="generate",
+                    max_wait_seconds=acquire_wait,
+                )
+                if not key:
+                    await _raise_pool_error(pool, request_id, provider.name)
+                leased_key = key
+                attempt_model = key_model or model
+
+                # Gemini File API refs are scoped to the uploading key's project, so
+                # upload and generate MUST use the same key — otherwise generate gets a
+                # 403 "permission to access the File". Upload (or re-upload) under the
+                # currently-leased key whenever we don't hold a ref for this exact key.
+                if requires_upload and uploaded_ref_key != key:
+                    if uploaded_ref is not None and uploaded_ref_key:
+                        await provider.delete_uploaded_media(uploaded_ref, uploaded_ref_key)
+                        uploaded_ref = None
+                        uploaded_ref_key = None
                     try:
-                        uploaded_ref = await provider.upload_media(media_path, upload_key)
-                        uploaded_ref_key = upload_key
+                        uploaded_ref = await provider.upload_media(media_path, key)
+                        uploaded_ref_key = key
                         await tracker.record_call(
-                            provider.name, "upload", attempt_model, key_suffix(upload_key), True, "uploaded", total_tokens=0
+                            provider.name, "upload", attempt_model, key_suffix(key), True, "uploaded", total_tokens=0
                         )
-                        await pool.record_success(upload_key, attempt_model)
                     except Exception as upload_err:
                         message = str(upload_err)
                         await tracker.record_call(
-                            provider.name, "upload", attempt_model, key_suffix(upload_key), False, message, total_tokens=0
+                            provider.name, "upload", attempt_model, key_suffix(key), False, message, total_tokens=0
                         )
                         classification = provider.classify_error(message)
-                        await pool.report_failure(upload_key, attempt_model, classification, tracker=tracker)
+                        await pool.report_failure(key, attempt_model, classification, tracker=tracker)
                         usage_logger.log_call(
                             request_id=request_id,
                             service=provider.name,
                             method="upload",
                             model=attempt_model,
                             quota_model=tracker.resolve_model(attempt_model),
-                            api_key_suffix=key_suffix(upload_key),
+                            api_key_suffix=key_suffix(key),
                             success=False,
                             input_tokens=None,
                             output_tokens=None,
@@ -114,17 +140,6 @@ async def run_generate(
                             error=message,
                         )
                         continue
-
-                key, key_model = await pool.acquire_key(
-                    tracker=tracker,
-                    service=provider.name,
-                    method="generate",
-                    max_wait_seconds=settings.acquire_key_max_wait_seconds,
-                )
-                if not key:
-                    await _raise_pool_error(pool, request_id, provider.name)
-                leased_key = key
-                attempt_model = key_model or model
 
                 if rate_limiter:
                     await rate_limiter.wait_if_needed(key)
@@ -135,7 +150,7 @@ async def run_generate(
                     media_path=media_path if uploaded_ref is None else None,
                     model=attempt_model,
                     api_key=key,
-                    timeout_seconds=req.timeout_seconds,
+                    timeout_seconds=effective_timeout,
                     verbose=req.verbose,
                     request_id=request_id,
                     extra={"uploaded_ref": uploaded_ref} if uploaded_ref is not None else {},
@@ -207,13 +222,25 @@ async def run_generate(
                         error=message,
                     )
 
-                if classification.reason == FailureReason.AUTH_DEAD and uploaded_ref is not None:
+                if (
+                    classification.reason in (FailureReason.STALE_MEDIA, FailureReason.AUTH_DEAD)
+                    and uploaded_ref is not None
+                ):
+                    # Stale/expired file ref or a dead key — drop the ref so the next
+                    # attempt re-uploads under a fresh key. STALE_MEDIA does not cool the
+                    # key (see report_failure), so a cross-key 403 no longer kills the pool.
+                    if uploaded_ref_key:
+                        await provider.delete_uploaded_media(uploaded_ref, uploaded_ref_key)
                     uploaded_ref = None
+                    uploaded_ref_key = None
                 elif classification.reason in (FailureReason.RATE_LIMIT, FailureReason.HIGH_DEMAND):
                     if attempt < max_retries - 1:
                         await asyncio.sleep(1)
                     if requires_upload and uploaded_ref is not None:
+                        if uploaded_ref_key:
+                            await provider.delete_uploaded_media(uploaded_ref, uploaded_ref_key)
                         uploaded_ref = None
+                        uploaded_ref_key = None
 
                 if attempt >= max_retries - 1:
                     raise

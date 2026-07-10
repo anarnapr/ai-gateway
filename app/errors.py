@@ -29,6 +29,16 @@ class PoolExhaustedHTTPError(GatewayError):
         self.key_statuses = key_statuses or []
 
 
+class JobsQueueFullHTTPError(GatewayError):
+    """The jobs queue is at jobs_max_queue_length — caller should retry the submit
+    later. Maps to HTTP 429 with retry_after_seconds body + Retry-After header
+    (same hard product requirement as PoolExhausted)."""
+
+    def __init__(self, request_id: str, retry_after_seconds: float):
+        super().__init__("queue_full", "Jobs queue is full; retry the submit later.", request_id)
+        self.retry_after_seconds = retry_after_seconds
+
+
 class AllKeysDeadHTTPError(GatewayError):
     """Every configured key is dead_auth/dead_quota, or no keys are configured. Maps to
     HTTP 503 — this is a total outage, not a transient rate limit.
@@ -48,6 +58,17 @@ def register_exception_handlers(app: FastAPI) -> None:
             detail=exc.detail,
             retry_after_seconds=exc.retry_after_seconds,
             key_statuses=[KeyStatusEntry(**k) for k in exc.key_statuses],
+        )
+        headers = {"Retry-After": str(max(1, math.ceil(exc.retry_after_seconds)))}
+        return JSONResponse(status_code=429, content=body.model_dump(), headers=headers)
+
+    @app.exception_handler(JobsQueueFullHTTPError)
+    async def _handle_queue_full(request: Request, exc: JobsQueueFullHTTPError):
+        body = GenerateErrorResponse(
+            request_id=exc.request_id,
+            error=exc.error,
+            detail=exc.detail,
+            retry_after_seconds=exc.retry_after_seconds,
         )
         headers = {"Retry-After": str(max(1, math.ceil(exc.retry_after_seconds)))}
         return JSONResponse(status_code=429, content=body.model_dump(), headers=headers)

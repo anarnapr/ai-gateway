@@ -11,6 +11,8 @@ from fastapi.responses import JSONResponse
 from app.api.router import api_router
 from app.config import get_settings
 from app.errors import GatewayError, register_exception_handlers
+from app.jobs.store import JobStore
+from app.jobs.worker import JobWorkerPool
 from app.logging_conf import configure_logging
 from app.pool.key_pool import AsyncAPIKeyPool
 from app.pool.redis_keys import RedisKeys
@@ -75,12 +77,30 @@ async def lifespan(app: FastAPI):
     app.state.rate_limiters = rate_limiters
     app.state.usage_logger = usage_logger
 
+    # Batch jobs: Redis-backed queue + in-process asyncio worker pool.
+    job_store = JobStore(redis_client, rk, settings)
+    job_worker_pool = JobWorkerPool(
+        store=job_store,
+        providers={name: registry.get(name) for name in registry.names()},
+        pools=pools,
+        trackers=trackers,
+        rate_limiters=rate_limiters,
+        usage_logger=usage_logger,
+        settings=settings,
+    )
+    job_worker_pool.start()
+    app.state.job_store = job_store
+    app.state.job_worker_pool = job_worker_pool
+
     logger.info("Gateway started. Providers: %s", list(pools.keys()))
     for name, pool in pools.items():
         logger.info("Provider '%s': %d key(s) configured.", name, pool.size())
+    logger.info("Jobs worker pool started (%d workers).", settings.jobs_worker_concurrency)
 
     yield
 
+    # Drain/cancel workers BEFORE closing Redis — requeueing in-flight items needs it.
+    await job_worker_pool.stop()
     await close_redis()
 
 

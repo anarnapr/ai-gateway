@@ -68,10 +68,9 @@ def call_tracker(fake_redis, redis_keys) -> CallTracker:
     )
 
 
-@pytest.fixture
-def api_client(monkeypatch, tmp_path):
-    """A TestClient wired to a shared FakeRedis instance instead of a real Redis
-    server, with a short acquire_key wait budget so pool-exhaustion tests run fast.
+def _make_api_client(monkeypatch, tmp_path, extra_env: dict[str, str] | None = None):
+    """TestClient wired to a shared FakeRedis instance instead of a real Redis server,
+    with a short acquire_key wait budget so pool-exhaustion tests run fast.
     Logs/uploads are redirected under pytest's tmp_path so test runs never write into
     the real tmp/ai/ directory a locally running dev server also reads from.
     """
@@ -81,6 +80,8 @@ def api_client(monkeypatch, tmp_path):
     monkeypatch.setenv("ACQUIRE_KEY_MAX_WAIT_SECONDS", "1.0")
     monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setenv("UPLOADS_DIR", str(tmp_path / "uploads"))
+    for k, v in (extra_env or {}).items():
+        monkeypatch.setenv(k, v)
 
     from app.config import get_settings
 
@@ -93,9 +94,49 @@ def api_client(monkeypatch, tmp_path):
 
     from app.main import app as fastapi_app
 
-    with TestClient(fastapi_app) as client:
+    client_cm = TestClient(fastapi_app)
+
+    def _cleanup():
+        redis_client_module._client = None
+        get_settings.cache_clear()
+
+    return client_cm, fake, _cleanup
+
+
+@pytest.fixture
+def api_client(monkeypatch, tmp_path):
+    client_cm, fake, cleanup = _make_api_client(
+        monkeypatch,
+        tmp_path,
+        # Keep the sync-path fixture cheap: no idle job workers spinning.
+        extra_env={"JOBS_WORKER_CONCURRENCY": "0", "JOBS_REAPER_INTERVAL_SECONDS": "3600"},
+    )
+    with client_cm as client:
         client.state_redis = fake  # convenience handle for tests that need direct access
         yield client
+    cleanup()
 
-    redis_client_module._client = None
-    get_settings.cache_clear()
+
+@pytest.fixture
+def jobs_api_client(monkeypatch, tmp_path):
+    """api_client variant with live job workers on fast test knobs."""
+    client_cm, fake, cleanup = _make_api_client(
+        monkeypatch,
+        tmp_path,
+        extra_env={
+            "JOBS_WORKER_CONCURRENCY": "4",
+            "JOBS_POLL_INTERVAL_SECONDS": "0.02",
+            "JOBS_RETRY_DELAY_SECONDS": "0.05",
+            "JOBS_RETRY_MAX_DELAY_SECONDS": "0.1",
+            "JOBS_REAPER_INTERVAL_SECONDS": "0.2",
+            "JOBS_SHUTDOWN_GRACE_SECONDS": "1.0",
+            # Only 2 fixture keys — the default 5s per-key min-interval would stall
+            # multi-item batches past the polling deadline.
+            "RATE_LIMIT_MIN_INTERVAL_SECONDS": "0.01",
+            "RATE_LIMIT_RPM": "1000",
+        },
+    )
+    with client_cm as client:
+        client.state_redis = fake
+        yield client
+    cleanup()

@@ -119,6 +119,43 @@ curl -s -X POST localhost:8080/v1/generate/media \
   -F 'file=@photo.jpg' | jq .
 ```
 
+### Batch jobs API (async, parallel)
+
+For fan-out workloads (e.g. "describe these 36 reels"), don't hold 36 HTTP connections —
+submit a batch, let the gateway's internal worker pool (`JOBS_WORKER_CONCURRENCY`, default
+20 asyncio workers) process items in parallel across the whole key pool, and poll:
+
+1. **`POST /v1/jobs`** — JSON `{provider?, model?, items: [{item_id?, prompt|parts,
+   model?, timeout_seconds?, metadata?, has_media?}]}` → `201 {batch_id, total, items}`.
+   Text-only items are queued immediately; `has_media: true` items wait in
+   `awaiting_media`. Queue full → `429` with `retry_after_seconds` + `Retry-After`.
+2. **`POST /v1/jobs/{batch_id}/items/{item_id}/media`** — multipart `file`, one call per
+   media item. Flips the item to `queued`; processing starts immediately (no need to
+   finish all uploads first). `409` if the item isn't awaiting media.
+3. **`GET /v1/jobs/{batch_id}`** — `{status, counts, items: [...]}` in submit order.
+   Poll until `status == "completed"`. Succeeded items carry `text`/token counts;
+   failed items carry `error` + `error_code` (`generate_failed` | `pool_exhausted` |
+   `all_keys_dead`) — items are never silently dropped. Results expire after 24h
+   (`JOBS_RESULT_TTL_SECONDS`).
+4. `GET /v1/jobs/{batch_id}/items/{item_id}` — single-item view (debugging).
+
+Item lifecycle: `awaiting_media → queued → running → succeeded | failed`. Each item runs
+through the same `run_generate` pipeline as the sync endpoint (key rotation, same-key
+media pinning, timeouts, tracking) with a wider per-attempt deadline
+(`JOBS_ITEM_DEADLINE_SECONDS`, default 300s — no HTTP client is waiting). Failed attempts
+retry server-side: real failures up to `JOBS_ITEM_MAX_ATTEMPTS` (3), pool-capacity waits
+on a separate `JOBS_CAPACITY_MAX_RETRIES` (10) budget honoring `retry_after_seconds`.
+
+Reliability: queue and all job state live in Redis (`jobs:queue` → `LMOVE` →
+`jobs:processing` + per-item lease). A crashed worker's items are requeued by a reaper
+task (boot sweep + every `JOBS_REAPER_INTERVAL_SECONDS`). Graceful shutdown drains or
+requeues in-flight items — nothing is lost. Note: uploaded media files are host-local
+(`UPLOADS_DIR`) — the one piece of state outside Redis; multi-host workers would need a
+shared volume.
+
+Deploy tip for video workloads: set `LEASE_TTL_MS=300000` — the default 120s key-lease
+TTL can expire mid-item on a 2-minute reel.
+
 ### Error responses
 
 - **`429`** — every candidate key/model is in backoff within `max_retries` / the wait
@@ -170,6 +207,11 @@ potentially 30+ minute backoff.
 | `usage:key:{key_id}` | INTEGER | Least-used tie-break for key selection. |
 | `usage:rpm:{key_id}:{model}` | ZSET | Atomic prune+check+reserve via `reserve_rpm.lua`. |
 | `tracker:rpm:{model}:{suffix}` / `tracker:rpd:...` / `tracker:tokens_day:...` | ZSET / STRING | `CallTracker`'s quota-table enforcement (separate from the pool's own RPM cap). |
+| `jobs:queue` / `jobs:processing` | LIST | Batch jobs work queue; claim = atomic `LMOVE`. |
+| `jobs:lease:{batch_id}:{item_id}` | STRING, EX | Worker liveness for an in-flight item; reaper requeues entries without one. |
+| `jobs:batch:{batch_id}` | HASH, EX | Batch status + `HINCRBY` counters (queued/running/succeeded/failed/…). |
+| `jobs:batch_items:{batch_id}` | LIST, EX | Item ids in submit order. |
+| `jobs:item:{batch_id}:{item_id}` | HASH, EX | Item request, status, attempts, result/error fields. |
 
 **Two separate rate-limiting layers**, matching the source repo's original design: the
 pool's own simple per-key RPM cap (`DEFAULT_RPM`), and `CallTracker`'s per-model

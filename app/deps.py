@@ -40,3 +40,7 @@ def get_rate_limiter(request: Request, provider_name: str = "gemini") -> RateLim
 
 def get_usage_logger(request: Request) -> UsageLogger:
     return request.app.state.usage_logger
+
+
+def get_job_store(request: Request):
+    return request.app.state.job_store

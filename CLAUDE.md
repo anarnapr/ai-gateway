@@ -43,6 +43,22 @@ added later without redesigning the pool/tracker layer.
   `APICallTracker` only ever stored `total_token_count`; this was a fixed gap the service
   requirements explicitly call out — don't regress it.
 
+## Batch Jobs (app/jobs/)
+- Async queue: `POST /v1/jobs` → Redis queue → in-process asyncio `JobWorkerPool`
+  (started/stopped in `app/main.py` lifespan — never FastAPI `BackgroundTasks`, those
+  are response-scoped). Workers reuse `run_generate` from `app/api/v1/generate.py`;
+  do not fork a second generation pipeline.
+- **No blocking Redis list ops** (`BLPOP`/`BLMOVE`) in workers — fakeredis-based tests
+  and graceful shutdown rely on the non-blocking `LMOVE` + poll design.
+- Worker shutdown (`JobWorkerPool.stop()`) must run **before** `close_redis()` —
+  requeueing in-flight items during drain needs Redis.
+- Refresh the item lease (`JobStore.refresh_lease`) before any retry sleep, or the
+  reaper will requeue an item a live worker still holds.
+- Uploaded batch media lives under `UPLOADS_DIR/jobs/{batch_id}/{item_id}/` on the
+  local filesystem — the ONE piece of shared state outside Redis. Fine single-host;
+  multi-host workers need a shared volume. The worker deletes the dir only on terminal
+  success/failure, never on requeue.
+
 ## Known Gotchas
 - **Classify by stored reason, not cooldown duration.** `classify_key_status`'s global
   cooldown branch used to infer `dead_auth` vs `short_cooldown` purely from remaining TTL

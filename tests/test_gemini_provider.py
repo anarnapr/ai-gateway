@@ -14,6 +14,12 @@ from app.providers.gemini.provider import GeminiProvider
     [
         ("400 API key not valid. Please pass a valid API key.", FailureReason.AUTH_DEAD),
         ("PERMISSION_DENIED: caller does not have permission", FailureReason.AUTH_DEAD),
+        # Cross-key/expired File API ref: 403 but must NOT be treated as a dead key,
+        # else uploading with key A + generating with key B cascades the whole pool.
+        (
+            "403 PERMISSION_DENIED. You do not have permission to access the File abc123 or it may not exist.",
+            FailureReason.STALE_MEDIA,
+        ),
         ("daily quota exceeded for this project", FailureReason.QUOTA_EXHAUSTED),
         ("404 models/foo is not found for API version v1beta", FailureReason.NOT_FOUND),
         ("429 Resource has been exhausted (e.g. check quota).", FailureReason.RATE_LIMIT),
