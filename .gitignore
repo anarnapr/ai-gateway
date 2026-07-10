@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+.env
+tmp/
+.pytest_cache/
+.coverage
+*.log
+.claude-flow/

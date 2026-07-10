@@ -1,0 +1,43 @@
+# Per-provider model configuration: priority/fallback order, per-model quota table
+# (rpm/tpm/rpd, -1 = unlimited), and model name aliases. Loaded once at startup by
+# ProviderRegistry. Edit and restart the service to apply changes (no hot-reload in v1).
+
+gemini:
+  model_priority:
+    - gemini-3.1-flash-lite-preview
+    - gemini-3.1-flash-preview
+    - gemini-3-flash-preview
+    - gemini-2.5-flash-lite
+    - gemini-2.5-flash
+    - gemini-2.0-flash
+    - gemini-2.0-flash-lite
+    - gemini-1.5-flash
+    - gemini-1.5-pro
+
+  # Resolves a caller-supplied shorthand/alias to the concrete model id used for both the
+  # SDK call and quota lookups.
+  model_aliases:
+    gemini-3.1: gemini-3.1-flash-preview
+    gemini-3: gemini-3-flash-preview
+    gemini-3.1-flash-lite: gemini-3.1-flash-lite-preview
+    gemini-3.1-flash: gemini-3.1-flash-preview
+    gemini-3-flash: gemini-3-flash-preview
+    gemini-flash-latest: gemini-2.0-flash
+
+  quota_table:
+    gemini-3.1-flash-lite-preview: {rpm: 15, tpm: 1000000, rpd: 500}
+    gemini-3.1-flash-preview: {rpm: 15, tpm: 1000000, rpd: 500}
+    gemini-3-flash-preview: {rpm: 15, tpm: 1000000, rpd: 500}
+    gemini-2.5-flash-lite: {rpm: 15, tpm: 1000000, rpd: 500}
+    gemini-2.5-flash: {rpm: 15, tpm: 1000000, rpd: 500}
+    gemini-2.0-flash: {rpm: 15, tpm: 1000000, rpd: 2000}
+    gemini-2.0-flash-lite: {rpm: 30, tpm: 1000000, rpd: 2000}
+    gemini-1.5-flash: {rpm: 15, tpm: 1000000, rpd: 1500}
+    gemini-1.5-pro: {rpm: 2, tpm: 32000, rpd: 50}
+
+  backoff:
+    rate_limit_base_seconds: 30.0
+    high_demand_base_seconds: 8.0
+    max_backoff_seconds: 1800.0
+    max_streak: 8
+    jitter_fraction: 0.25
