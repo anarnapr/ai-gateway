@@ -75,6 +75,26 @@ added later without redesigning the pool/tracker layer.
   to `tmp_path`. If you add a new fixture that boots the app, do the same — otherwise
   test runs will write into (and pollute) the real `tmp/ai/logs/` a local dev server
   also reads from.
+- **Per-key cooldown alone doesn't move a large pool off a saturated model.**
+  `RATE_LIMIT`/`HIGH_DEMAND` only ever cooled the one key that failed
+  (`cooldown_keymodel`) — with a big key pool, `acquire_key()` kept finding a different
+  "available" key on the same externally-throttled model almost indefinitely, since a
+  model-wide cooldown previously only tripped once *every* key was individually
+  `dead_auth`/`dead_quota`. `AsyncAPIKeyPool._maybe_trip_model_breaker()`
+  (`app/pool/key_pool.py`) now trips a short model-wide `cooldown_model()` off failure
+  *velocity* — `model_circuit_breaker_threshold` RATE_LIMIT/HIGH_DEMAND hits across any
+  key within `model_circuit_breaker_window_seconds` — so the pool falls back down
+  `model_priority` in seconds instead of never. Self-heals after
+  `model_circuit_breaker_cooldown_seconds`.
+- **`FailureReason.UNKNOWN` must stay a no-op in `report_failure()`.** Tempting to add a
+  cooldown there too (unclassified errors can hot-loop with zero backoff), but the jobs
+  worker (`app/jobs/worker.py`) relies on unclassified `run_generate` failures
+  propagating as a real exception — bounded item-level retries, then reported as
+  `generate_failed`. Cooling the key/model there instead routes retries through
+  `PoolExhaustedHTTPError`'s much larger capacity-retry budget, which just delays
+  reporting a real (often permanent, request-shaped) failure. Covered by
+  `tests/test_key_pool.py::test_unknown_failure_does_not_cool_key_or_model` — don't
+  regress it without re-reading `test_failed_items_carry_error_not_silent_drop` first.
 
 ## Database / State
 No SQL database — all shared state lives in Redis (see README "Redis data model" for the

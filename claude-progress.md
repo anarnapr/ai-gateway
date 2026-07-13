@@ -1,7 +1,7 @@
 # claude-progress.md - Status
 
-> Last updated: 2026-07-10 (evening — incident fixes + batch jobs API shipped)
-> Status: Batch jobs API complete (67 tests green); production incident root-caused and fixed
+> Last updated: 2026-07-13 (model-wide circuit breaker shipped)
+> Status: Batch jobs API complete; production rate-limit incident root-caused and fixed (69 tests green)
 
 ## Current State
 `ai-gateway` is a new standalone FastAPI microservice, extracted from
@@ -45,6 +45,28 @@ dicts only worked within a single process.
   honoring `retry_after_seconds`. Failed items return `error`/`error_code` — no more
   silent drops. Results expire after 24h. `max_in_flight` raised 4→27 (= key count;
   leases are per-key-exclusive so that's the true ceiling). 67 tests total.
+- [x] **Model-wide circuit breaker** (2026-07-13): a real batch job on the 27-key pool
+  sat hammering `gemini-3.1-flash-lite-preview` for 15+ minutes despite continuous 429s,
+  never falling back to the next model in `model_priority`. Root cause: `RATE_LIMIT`/
+  `HIGH_DEMAND` only ever cooled the *one* key that got the error
+  (`cooldown_keymodel`); the model-wide blacklist only tripped once *every* key was
+  individually `dead_auth`/`dead_quota`, which a live rate-limit storm on a large pool
+  essentially never reaches — with 27 keys there's almost always some other key off
+  cooldown, so `acquire_key()` kept "succeeding" locally while Google kept 429ing.
+  Added `AsyncAPIKeyPool._maybe_trip_model_breaker()`: tracks RATE_LIMIT/HIGH_DEMAND
+  failure *velocity* across the whole model (any key) in a Redis ZSET
+  (`cooldown:model_events:{model}`), trips a short model-wide `cooldown_model()` once
+  `MODEL_CIRCUIT_BREAKER_THRESHOLD` hits land within `MODEL_CIRCUIT_BREAKER_WINDOW_SECONDS`
+  — pool falls back down `model_priority` in seconds, self-heals after
+  `MODEL_CIRCUIT_BREAKER_COOLDOWN_SECONDS` (default 20s) instead of the old 1h dead-model
+  cooldown. Considered also backing off `FailureReason.UNKNOWN` (currently a no-op in
+  `report_failure()`, so unclassified errors like Gemini's transient "unable to process
+  input image" 400 hot-loop with zero delay) — reverted after it broke
+  `test_failed_items_carry_error_not_silent_drop`: cooling the key/model on UNKNOWN
+  routes retries through `PoolExhaustedHTTPError`'s much larger capacity-retry budget
+  instead of letting the jobs worker's bounded item-retry path report
+  `generate_failed` quickly. Left as an intentional no-op — see CLAUDE.md gotchas. 69
+  tests total.
 
 ## Bugs Found & Fixed During Verification
 - [x] **Cooldown classification race**: `classify_key_status` inferred `dead_auth` vs
@@ -104,6 +126,22 @@ earlier test run) success entry and full error detail captured on failures.
   inefficiency, harden later (retry the GET instead).
 
 ## Not Yet Done
+- **`FailureReason.UNKNOWN` still gets zero cooldown** — Gemini's transient "unable to
+  process input image" 400 (68 occurrences in one day's log) retries the same key/model
+  back-to-back with no delay. Tried a short backoff, reverted (see the circuit-breaker
+  entry above) because it conflicts with the jobs worker's fast-fail contract for
+  genuinely permanent per-request failures. Needs a more surgical fix (e.g. distinguish
+  "likely transient" vs "likely permanent" UNKNOWN messages) before revisiting.
+- **`.env`'s `GEMINI_API_KEYS` mixes credential formats** — some entries are `AQ.Ab8...`
+  (looks like a Google OAuth token, not a Gemini Developer API key), which
+  `genai.Client(api_key=...)` rejects with `400 API_KEY_INVALID` every time. Already
+  gets classified `AUTH_DEAD` and 1h-cooled correctly, so it's not a hot-loop, but it's
+  dead weight in the pool — should be pruned to real `AIzaSy...` keys.
+- **Pool's own RPM cap ignores the per-model `quota_table`** — `AsyncAPIKeyPool.rpm` is
+  one flat value (`DEFAULT_RPM`, 15) applied to every model uniformly; the per-model
+  rpm/tpm/rpd in `config/models.yaml` is only enforced by `CallTracker`, a separate
+  mechanism. Not wired together — worth reconciling if per-model RPM limits diverge much
+  from `DEFAULT_RPM`.
 - Migrating `socials-instagram`'s batch fan-out callers (`instagram_learning.py`,
   `qualify_utils.py`, `stage1_context.py`, `idea_generator.py`) from client-side
   thread pools over sync `/v1/generate/media` to the new `/v1/jobs` submit→upload→poll

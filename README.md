@@ -78,6 +78,9 @@ docker compose up --build
 | `RATE_LIMIT_MIN_INTERVAL_SECONDS` | `5.0` | Minimum spacing between requests on the same key. |
 | `RATE_LIMIT_RPM` | `12` | Secondary per-key RPM throttle. |
 | `DEAD_COOLDOWN_SECONDS` | `3600.0` | Requested cooldown length for dead/exhausted keys. **Always clamped to ≤3600s regardless of this value** — see "Hard 1-hour cap" below. |
+| `MODEL_CIRCUIT_BREAKER_THRESHOLD` | `4` | RATE_LIMIT/HIGH_DEMAND hits across any key, within the window below, that trips a short model-wide cooldown. |
+| `MODEL_CIRCUIT_BREAKER_WINDOW_SECONDS` | `30.0` | Rolling window the threshold above counts over. |
+| `MODEL_CIRCUIT_BREAKER_COOLDOWN_SECONDS` | `20.0` | How long the model is dropped from candidates once the breaker trips — short and self-healing, distinct from the 1h `DEAD_COOLDOWN_SECONDS` clamp. |
 | `ACQUIRE_KEY_MAX_WAIT_SECONDS` | `10.0` | How long a request will wait internally for a key to free up before the HTTP handler gives up and returns `429` with `Retry-After`. Deliberately short — see design note below. |
 | `MODELS_CONFIG_PATH` | `config/models.yaml` | Model priority/aliases/quota table per provider. |
 | `LOG_DIR` | `tmp/ai/logs` | Durable JSONL call log + error log + app log. |
@@ -193,6 +196,21 @@ process. This is now an HTTP request path with a client holding a connection ope
 with an accurate `retry_after_seconds` instead of holding the connection for a
 potentially 30+ minute backoff.
 
+**Model circuit breaker.** Per-key cooldowns alone don't scale down a large pool fast:
+`RATE_LIMIT`/`HIGH_DEMAND` only cools the *one* key that got the error, so with e.g. 27
+keys `acquire_key()` keeps finding a different "available" key on the same
+externally-throttled model almost indefinitely — the old model-wide blacklist only
+tripped once *every* key was individually `dead_auth`/`dead_quota`, which a live
+rate-limit storm rarely reaches. `AsyncAPIKeyPool._maybe_trip_model_breaker()` instead
+watches failure *velocity* across the whole model (any key): `MODEL_CIRCUIT_BREAKER_THRESHOLD`
+hits within `MODEL_CIRCUIT_BREAKER_WINDOW_SECONDS` trips a short
+`MODEL_CIRCUIT_BREAKER_COOLDOWN_SECONDS` model-wide cooldown, so the pool falls back down
+`model_priority` within seconds and retries the throttled model again shortly after —
+self-healing rather than the old hour-long dead-model cooldown. Deliberately does not
+fire on `FailureReason.UNKNOWN` (unclassified 400s etc.) — those are as likely to be a
+bad request payload as provider capacity, and the jobs worker depends on unclassified
+failures propagating fast rather than being absorbed into a cooldown.
+
 **Redis data model** (prefix `{REDIS_KEY_PREFIX}:`, keys are never stored raw — see
 `app/pool/redis_keys.py`, hashed via `sha256(api_key)[:16]`):
 
@@ -200,7 +218,8 @@ potentially 30+ minute backoff.
 |---|---|---|
 | `cooldown:key:{key_id}` | STRING, EX | Global key cooldown (e.g. `auth_dead`). |
 | `cooldown:keymodel:{key_id}:{model}` | STRING, EX | Per-model cooldown (quota/rate-limit/high-demand). |
-| `cooldown:model:{model}` | STRING, EX | Model blacklist (all keys exhausted, or 404). |
+| `cooldown:model:{model}` | STRING, EX | Model blacklist — all keys exhausted / 404 (long, clamped ≤1h), or circuit breaker tripped (short, `MODEL_CIRCUIT_BREAKER_COOLDOWN_SECONDS`). |
+| `cooldown:model_events:{model}` | ZSET, EX | Rolling RATE_LIMIT/HIGH_DEMAND failure timestamps across all keys for a model — feeds the circuit breaker; separate from the trip switch above. |
 | `failure_meta:{key_id}[:{model}]` | HASH, EX | `{reason, streak, cooldown_seconds, updated_at}` — drives "dead + why". |
 | `leased:{key_id}` | STRING, `SET NX PX` | Atomic cross-process lease with a TTL safety net. |
 | `inflight:tokens` | ZSET | Global in-flight cap, Lua-scripted acquire/release. |
@@ -256,6 +275,13 @@ client — no network calls or real API keys required.
 
 ## Recent changes
 
+- **Model-wide circuit breaker** (2026-07-13): production job (27-key pool) sat on one
+  rate-limited preview model for 15+ minutes instead of falling back — per-key cooldowns
+  only ever cooled the one key that failed, so a large pool kept finding another
+  "available" key on the same throttled model. `AsyncAPIKeyPool._maybe_trip_model_breaker()`
+  now trips a short model-wide cooldown off failure velocity (any key) instead of
+  requiring every key to individually die. New `MODEL_CIRCUIT_BREAKER_*` settings. 69
+  tests total.
 - Initial extraction from `services/support/ai/` in `socials-instagram`: FastAPI +
   Redis-backed pool/tracker/rate-limiter, Gemini provider, `/v1/generate[/media]`,
   pool/keys/usage/health endpoints, Docker Compose dev setup, test suite.

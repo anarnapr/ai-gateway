@@ -72,6 +72,15 @@ gemini/
   usage counters) — see `app/pool/redis_keys.py` for the naming scheme.
 - **Cooldowns never exceed 1 hour.** Always write cooldown TTLs through
   `settings.clamped_dead_cooldown_seconds`, never a raw duration.
+- **Model-wide throttling must key off failure velocity, not "every key individually
+  dead."** With a large pool, per-key `RATE_LIMIT`/`HIGH_DEMAND` cooldowns alone never
+  get the pool to fall back to the next model — see
+  `AsyncAPIKeyPool._maybe_trip_model_breaker()` in `app/pool/key_pool.py` and the
+  `MODEL_CIRCUIT_BREAKER_*` settings.
+- **`FailureReason.UNKNOWN` stays uncooled in `report_failure()`.** The jobs worker
+  needs unclassified failures to propagate as a real exception (bounded item retries →
+  `generate_failed`), not get absorbed into the pool's capacity-retry path. See the
+  "Known Gotchas" entry in `CLAUDE.md` before touching this.
 - **429 must carry retry guidance**: `retry_after_seconds` in the body and a
   `Retry-After` HTTP header, every time.
 - **Keep `acquire_key()` bounded** (`ACQUIRE_KEY_MAX_WAIT_SECONDS`) — this is an HTTP
