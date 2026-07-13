@@ -100,3 +100,45 @@ async def test_not_found_blacklists_model_for_all_keys(key_pool: AsyncAPIKeyPool
 
     candidates = await key_pool._get_candidate_models(time.time())
     assert model not in candidates
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_trips_model_circuit_breaker_across_keys(fake_redis, settings):
+    # Large pool: RATE_LIMIT only cools the one key that failed, so with many keys
+    # _get_candidate_models() would otherwise keep finding a different "available" key
+    # on the same saturated model almost indefinitely. The breaker should trip on
+    # failure *velocity* across the model, well before every key is individually dead.
+    settings.model_circuit_breaker_threshold = 3
+    settings.model_circuit_breaker_window_seconds = 30.0
+    settings.model_circuit_breaker_cooldown_seconds = 20.0
+    keys = ",".join(f"key-{i:04d}" for i in range(10))
+    pool = AsyncAPIKeyPool(fake_redis, keys, GEMINI_MODEL_PRIORITY, settings)
+    model = GEMINI_MODEL_PRIORITY[0]
+    classification = FailureClassification(reason=FailureReason.RATE_LIMIT, scope="key_model")
+
+    for i in range(2):
+        await pool.report_failure(f"key-{i:04d}", model, classification)
+    candidates = await pool._get_candidate_models(time.time())
+    assert model in candidates  # below threshold, and 8 of 10 keys still untouched
+
+    await pool.report_failure("key-0002", model, classification)
+    candidates_after = await pool._get_candidate_models(time.time())
+    assert model not in candidates_after  # 3rd hit within the window trips the breaker
+
+    fallback = await pool._get_candidate_models(time.time())
+    assert GEMINI_MODEL_PRIORITY[1] in fallback  # next priority model still usable
+
+
+@pytest.mark.asyncio
+async def test_unknown_failure_does_not_cool_key_or_model(key_pool: AsyncAPIKeyPool):
+    # Unclassified failures must stay a no-op here — the jobs worker relies on them
+    # propagating as a real exception (item-level retry -> "generate_failed") rather
+    # than being absorbed into the pool's much larger capacity-retry budget.
+    api_key = key_pool.api_keys[0]
+    model = GEMINI_MODEL_PRIORITY[0]
+    classification = FailureClassification(reason=FailureReason.UNKNOWN, scope="key_model")
+    await key_pool.report_failure(api_key, model, classification)
+
+    status, retry_in = await key_pool.classify_key_status(api_key, model, time.time())
+    assert status == KeyStatus.AVAILABLE.value
+    assert retry_in == 0.0

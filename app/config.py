@@ -24,6 +24,20 @@ class Settings(BaseSettings):
     dead_cooldown_seconds: float = 3600.0
     long_term_threshold_seconds: float = 3600.0
 
+    # Model-wide circuit breaker: per-key cooldowns alone don't move a large pool off
+    # a saturated model fast — with N keys, RATE_LIMIT/HIGH_DEMAND only cool one key at
+    # a time, so acquire_key() keeps finding a different "available" key on the same
+    # model long after the provider is clearly throttling it as a whole. Track failure
+    # *velocity* across the model (any key) instead: once `model_circuit_breaker_threshold`
+    # RATE_LIMIT/HIGH_DEMAND hits land within `model_circuit_breaker_window_seconds`
+    # (regardless of which key), cooldown_model() trips for a short
+    # `model_circuit_breaker_cooldown_seconds` so the model drops out of
+    # _get_candidate_models() and the pool falls back down model_priority immediately —
+    # then self-heals and retries this model again after the short window.
+    model_circuit_breaker_threshold: int = 4
+    model_circuit_breaker_window_seconds: float = 30.0
+    model_circuit_breaker_cooldown_seconds: float = 20.0
+
     models_config_path: str = "config/models.yaml"
 
     log_dir: str = "tmp/ai/logs"

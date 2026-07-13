@@ -444,7 +444,40 @@ class AsyncAPIKeyPool:
                 self.rk.cooldown_keymodel(kid, model), now + backoff, ex=max(1, math.ceil(backoff))
             )
             await self._set_failure_meta(kid, model, classification.reason.value, backoff, streak)
+            await self._maybe_trip_model_breaker(model, now)
             return
+
+        # FailureReason.UNKNOWN deliberately gets no cooldown here: the jobs worker
+        # (app/jobs/worker.py) treats a bare exception from run_generate as an
+        # item-level failure to retry a bounded number of times and then report as
+        # "generate_failed" — cooling the key/model here would instead route retries
+        # through the pool's capacity-exhaustion path (PoolExhaustedHTTPError), which
+        # has its own separate, much larger retry budget. For a genuinely
+        # request-shaped failure (bad payload, not a key/model health problem) that
+        # just delays reporting the real error without ever fixing it.
+
+    async def _maybe_trip_model_breaker(self, model: str, now: float) -> None:
+        """Model-wide circuit breaker: fires on failure *velocity* (N RATE_LIMIT/
+        HIGH_DEMAND hits across ANY key within a short window), not on "every key
+        individually cooled" like the QUOTA_EXHAUSTED path below. With a large key
+        pool, the latter basically never happens for a provider-side throttle — each
+        429 only cools the one key that hit it, so acquire_key() keeps finding a
+        different "available" key on the same saturated model instead of falling back
+        down model_priority. This trips fast and cools briefly (self-healing), so a
+        model that's genuinely fine again in 20s isn't penalized for an hour.
+        """
+        window = self.settings.model_circuit_breaker_window_seconds
+        zkey = self.rk.model_failure_events(model)
+        await self.redis.zadd(zkey, {str(uuid.uuid4()): now})
+        await self.redis.zremrangebyscore(zkey, 0, now - window)
+        await self.redis.expire(zkey, max(1, math.ceil(window)))
+        count = await self.redis.zcard(zkey)
+        if count < self.settings.model_circuit_breaker_threshold:
+            return
+        if await self.redis.exists(self.rk.cooldown_model(model)):
+            return
+        ttl = self.settings.model_circuit_breaker_cooldown_seconds
+        await self.redis.set(self.rk.cooldown_model(model), now + ttl, ex=max(1, math.ceil(ttl)))
 
     async def _set_failure_meta(self, kid: str, model: str, reason: str, cooldown_seconds: float, streak: int) -> None:
         now = time.time()

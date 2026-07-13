@@ -27,6 +27,13 @@ class RedisKeys:
     def cooldown_model(self, model: str) -> str:
         return f"{self.prefix}:cooldown:model:{model}"
 
+    def model_failure_events(self, model: str) -> str:
+        """ZSET of recent RATE_LIMIT/HIGH_DEMAND failure timestamps for this model,
+        across all keys — feeds the model-wide circuit breaker (see
+        Settings.model_circuit_breaker_*). Distinct from cooldown_model(), which is the
+        breaker's trip switch; this is the signal that decides when to trip it."""
+        return f"{self.prefix}:cooldown:model_events:{model}"
+
     def failure_meta(self, kid: str, model: str = "") -> str:
         return f"{self.prefix}:failure_meta:{kid}:{model}" if model else f"{self.prefix}:failure_meta:{kid}"
 
