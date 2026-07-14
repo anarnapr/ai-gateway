@@ -1,6 +1,6 @@
 # claude-progress.md - Status
 
-> Last updated: 2026-07-13 (model-wide circuit breaker shipped)
+> Last updated: 2026-07-14 (GET /v1/jobs list-all endpoint added)
 > Status: Batch jobs API complete; production rate-limit incident root-caused and fixed (69 tests green)
 
 ## Current State
@@ -67,6 +67,14 @@ dicts only worked within a single process.
   instead of letting the jobs worker's bounded item-retry path report
   `generate_failed` quickly. Left as an intentional no-op — see CLAUDE.md gotchas. 69
   tests total.
+- [x] **`GET /v1/jobs` list-all endpoint** (2026-07-14): there was previously no way to
+  see every batch the gateway was handling without already knowing a `batch_id` — every
+  read path (`get_batch_status`, `get_item`, `queue_length`) required one in hand. Added
+  a `jobs:all_batches` Redis ZSET (scored by `created_at`), populated by `create_batch()`;
+  `JobStore.list_batches()` reads it back newest-first and lazily `ZREM`s any batch_id
+  whose `jobs_batch()` hash has already expired (same pattern as the reaper's
+  `drop_entry`). Returns one summary row per batch (`status`, `total`, `counts`,
+  timestamps) — no per-item detail, use the existing per-batch endpoint for that.
 
 ## Bugs Found & Fixed During Verification
 - [x] **Cooldown classification race**: `classify_key_status` inferred `dead_auth` vs
@@ -126,6 +134,9 @@ earlier test run) success entry and full error detail captured on failures.
   inefficiency, harden later (retry the GET instead).
 
 ## Not Yet Done
+- **No test coverage yet for `GET /v1/jobs`** — the list-all endpoint (see milestone
+  above) shipped without a corresponding entry in `tests/test_api_jobs.py`. 69 tests
+  total is unchanged from before this endpoint was added.
 - **`FailureReason.UNKNOWN` still gets zero cooldown** — Gemini's transient "unable to
   process input image" 400 (68 occurrences in one day's log) retries the same key/model
   back-to-back with no delay. Tried a short backoff, reverted (see the circuit-breaker

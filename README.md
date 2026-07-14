@@ -141,6 +141,10 @@ submit a batch, let the gateway's internal worker pool (`JOBS_WORKER_CONCURRENCY
    `all_keys_dead`) — items are never silently dropped. Results expire after 24h
    (`JOBS_RESULT_TTL_SECONDS`).
 4. `GET /v1/jobs/{batch_id}/items/{item_id}` — single-item view (debugging).
+5. `GET /v1/jobs` — list every batch still tracked (newest first), one summary row
+   each: `{batch_id, status, total, counts, created_at, finished_at}` — no per-item
+   detail. Use this to see everything the gateway is currently handling without
+   knowing a `batch_id` up front.
 
 Item lifecycle: `awaiting_media → queued → running → succeeded | failed`. Each item runs
 through the same `run_generate` pipeline as the sync endpoint (key rotation, same-key
@@ -231,6 +235,7 @@ failures propagating fast rather than being absorbed into a cooldown.
 | `jobs:batch:{batch_id}` | HASH, EX | Batch status + `HINCRBY` counters (queued/running/succeeded/failed/…). |
 | `jobs:batch_items:{batch_id}` | LIST, EX | Item ids in submit order. |
 | `jobs:item:{batch_id}:{item_id}` | HASH, EX | Item request, status, attempts, result/error fields. |
+| `jobs:all_batches` | ZSET, scored by `created_at` | Every batch_id ever created; feeds `GET /v1/jobs` (list-all). Members for expired batches are lazily `ZREM`'d on read, not TTL'd directly. |
 
 **Two separate rate-limiting layers**, matching the source repo's original design: the
 pool's own simple per-key RPM cap (`DEFAULT_RPM`), and `CallTracker`'s per-model

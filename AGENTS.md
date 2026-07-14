@@ -40,6 +40,7 @@ curl -X POST localhost:8080/v1/jobs -H 'Content-Type: application/json' \
   -d '{"items": [{"item_id": "a", "prompt": "one"}, {"item_id": "b", "prompt": "two", "has_media": true}]}'
 curl -X POST localhost:8080/v1/jobs/{batch_id}/items/b/media -F 'file=@reel.mp4'
 curl localhost:8080/v1/jobs/{batch_id}
+curl localhost:8080/v1/jobs   # list every batch still tracked (summary only)
 ```
 
 ## Project Structure

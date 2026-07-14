@@ -54,6 +54,12 @@ added later without redesigning the pool/tracker layer.
   requeueing in-flight items during drain needs Redis.
 - Refresh the item lease (`JobStore.refresh_lease`) before any retry sleep, or the
   reaper will requeue an item a live worker still holds.
+- `GET /v1/jobs` lists every tracked batch (summary only, no items) via the
+  `jobs:all_batches` ZSET (`RedisKeys.jobs_all_batches()`), scored by `created_at`.
+  `create_batch()` `ZADD`s into it; nothing ever explicitly removes a member on
+  completion/expiry — `JobStore.list_batches()` lazily `ZREM`s any batch_id whose
+  `jobs_batch()` hash has already TTL'd out. Any new way of creating a batch must
+  also `ZADD` here or it won't show up in the list endpoint.
 - Uploaded batch media lives under `UPLOADS_DIR/jobs/{batch_id}/{item_id}/` on the
   local filesystem — the ONE piece of shared state outside Redis. Fine single-host;
   multi-host workers need a shared volume. The worker deletes the dir only on terminal
