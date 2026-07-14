@@ -68,6 +68,7 @@ class JobStore:
             },
         )
         pipe.expire(self.rk.jobs_batch(batch_id), initial_ttl)
+        pipe.zadd(self.rk.jobs_all_batches(), {batch_id: now})
 
         for it in items:
             item_id = it["item_id"]
@@ -245,6 +246,27 @@ class JobStore:
         return await self.redis.llen(self.rk.jobs_queue())
 
     # ---------- status (API side) ----------
+
+    async def list_batches(self) -> list[dict[str, Any]]:
+        """Summary (no per-item detail) for every batch still tracked, newest first."""
+        batch_ids = await self.redis.zrevrange(self.rk.jobs_all_batches(), 0, -1)
+        summaries = []
+        for batch_id in batch_ids:
+            batch = await self.redis.hgetall(self.rk.jobs_batch(batch_id))
+            if not batch:
+                await self.redis.zrem(self.rk.jobs_all_batches(), batch_id)
+                continue
+            summaries.append(
+                {
+                    "batch_id": batch_id,
+                    "status": batch.get("status", BatchStatus.PENDING.value),
+                    "total": int(batch.get("total", 0)),
+                    "counts": {f: int(batch.get(f, 0)) for f in _COUNTER_FIELDS},
+                    "created_at": float(batch.get("created_at", 0.0)),
+                    "finished_at": float(batch["finished_at"]) if batch.get("finished_at") else None,
+                }
+            )
+        return summaries
 
     async def get_batch_status(self, batch_id: str) -> Optional[dict[str, Any]]:
         batch = await self.redis.hgetall(self.rk.jobs_batch(batch_id))

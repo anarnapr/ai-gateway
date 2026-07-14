@@ -10,6 +10,7 @@ from app.deps import get_job_store, get_provider_registry, get_settings
 from app.errors import JobsQueueFullHTTPError
 from app.models.jobs import (
     BatchStatusResponse,
+    BatchSummary,
     ItemStatus,
     JobItemBrief,
     JobItemResult,
@@ -92,6 +93,12 @@ async def upload_item_media(request: Request, batch_id: str, item_id: str, file:
 
     await store.attach_media_and_enqueue(batch_id, item_id, str(media_path))
     return {"item_id": item_id, "status": ItemStatus.QUEUED.value}
+
+
+@router.get("/jobs", response_model=list[BatchSummary])
+async def list_batches(request: Request) -> list[BatchSummary]:
+    summaries = await get_job_store(request).list_batches()
+    return [BatchSummary(**s) for s in summaries]
 
 
 @router.get("/jobs/{batch_id}", response_model=BatchStatusResponse)

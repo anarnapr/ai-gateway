@@ -90,3 +90,12 @@ class BatchStatusResponse(BaseModel):
     created_at: float
     finished_at: Optional[float] = None
     items: list[JobItemResult]
+
+
+class BatchSummary(BaseModel):
+    batch_id: str
+    status: BatchStatus
+    total: int
+    counts: dict[str, int]
+    created_at: float
+    finished_at: Optional[float] = None

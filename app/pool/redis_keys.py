@@ -73,6 +73,12 @@ class RedisKeys:
         (queued/awaiting_media/running/succeeded/failed)."""
         return f"{self.prefix}:jobs:batch:{batch_id}"
 
+    def jobs_all_batches(self) -> str:
+        """ZSET of all batch_ids scored by created_at, for GET /jobs (list-all).
+        Members aren't removed when a batch's own keys expire — list_batches()
+        lazily ZREMs any member whose jobs_batch() hash has already expired."""
+        return f"{self.prefix}:jobs:all_batches"
+
     def jobs_batch_items(self, batch_id: str) -> str:
         """LIST of item_ids in submit order."""
         return f"{self.prefix}:jobs:batch_items:{batch_id}"
