@@ -67,6 +67,15 @@ class Settings(BaseSettings):
     # below the client's http timeout (client uses (timeout or 120)+30 = 150s).
     request_deadline_seconds: float = 120.0
 
+    # --- Media-by-URL (POST /v1/generate/media/url) ---
+    # Client sends a CDN URL instead of the raw file, so the gateway fetches it
+    # server-side. Bounded by scheme/size/timeout only (no private-IP/SSRF allowlist
+    # in v1 — this endpoint is assumed to sit behind the same trust boundary as the
+    # rest of the gateway; revisit if it's ever exposed to untrusted callers).
+    media_url_max_bytes: int = 50 * 1024 * 1024  # 50MB
+    media_url_download_timeout_seconds: float = 30.0
+    media_url_max_count: int = 10  # cap on media_urls per request; downloads run concurrently
+
     # --- Batch jobs API (app/jobs/) ---
     # Async queue: POST /v1/jobs enqueues items in Redis, an in-process asyncio worker
     # pool drains them through run_generate, clients poll GET /v1/jobs/{batch_id}.

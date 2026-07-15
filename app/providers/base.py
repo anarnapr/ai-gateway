@@ -25,7 +25,7 @@ class FailureClassification:
 class GenerateContext:
     prompt_text: Optional[str] = None
     prompt_parts: Optional[list[Union[str, dict]]] = None
-    media_path: Optional[str] = None
+    media_paths: list[str] = field(default_factory=list)
     model: str = ""
     api_key: str = ""
     timeout_seconds: Optional[float] = None

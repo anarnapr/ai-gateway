@@ -33,11 +33,20 @@ class JobItemSpec(BaseModel):
     timeout_seconds: Optional[float] = None
     metadata: Optional[dict] = None  # echoed back verbatim in results
     has_media: bool = False  # True -> item waits in awaiting_media until media uploaded
+    media_urls: Optional[list[str]] = None  # CDN urls -> worker downloads before generating
 
     @model_validator(mode="after")
     def _require_prompt_or_parts(self) -> "JobItemSpec":
         if not self.prompt and not self.parts:
             raise ValueError("Each item requires 'prompt' or 'parts'.")
+        return self
+
+    @model_validator(mode="after")
+    def _has_media_and_media_urls_are_exclusive(self) -> "JobItemSpec":
+        if self.has_media and self.media_urls:
+            raise ValueError("An item can't set both 'has_media' (multipart upload) and 'media_urls'.")
+        if self.media_urls is not None and not self.media_urls:
+            raise ValueError("'media_urls' must not be an empty list.")
         return self
 
 

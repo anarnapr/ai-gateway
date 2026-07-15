@@ -36,3 +36,18 @@ class GenerateRequest(BaseModel):
             else:
                 result.append(p)
         return result
+
+
+class GenerateMediaUrlRequest(GenerateRequest):
+    """Same as GenerateRequest, plus one or more CDN urls the gateway fetches
+    server-side instead of the caller uploading the raw files via multipart."""
+
+    media_urls: list[str]
+
+    @model_validator(mode="after")
+    def _media_urls_not_blank(self) -> "GenerateMediaUrlRequest":
+        if not self.media_urls:
+            raise ValueError("'media_urls' must not be empty.")
+        if any(not u.strip() for u in self.media_urls):
+            raise ValueError("'media_urls' entries must not be blank.")
+        return self

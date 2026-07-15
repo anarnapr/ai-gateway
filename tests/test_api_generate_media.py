@@ -11,7 +11,7 @@ def test_generate_media_success_and_cleans_up_upload(api_client, monkeypatch, tm
         return False  # small image -> inline part path, no File API upload needed
 
     async def fake_generate(self, ctx):
-        assert ctx.media_path is not None
+        assert len(ctx.media_paths) == 1
         return ProviderResult(text="described image", input_tokens=10, output_tokens=4, total_tokens=14)
 
     monkeypatch.setattr(GeminiProvider, "requires_file_upload", fake_requires_upload)
@@ -52,7 +52,7 @@ def test_generate_media_file_upload_pins_same_key_for_upload_and_generate(api_cl
 
     async def fake_generate(self, ctx):
         used_keys["generate"] = ctx.api_key
-        assert ctx.extra.get("uploaded_ref") is not None
+        assert ctx.extra.get("uploaded_refs")
         return ProviderResult(text="described video", input_tokens=10, output_tokens=4, total_tokens=14)
 
     async def fake_delete(self, ref, api_key):

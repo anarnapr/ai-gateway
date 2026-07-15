@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shutil
 from pathlib import Path
@@ -10,6 +11,7 @@ from app.api.v1.generate import run_generate
 from app.config import Settings
 from app.errors import AllKeysDeadHTTPError, PoolExhaustedHTTPError
 from app.jobs.store import JobStore
+from app.media_fetch import MediaDownloadError, download_media
 from app.models.requests import GenerateRequest
 from app.tracking.usage_logger import UsageLogger
 
@@ -115,12 +117,33 @@ class JobWorkerPool:
 
     # ---------- item processing ----------
 
-    def _cleanup_media(self, media_path: Optional[str]) -> None:
+    def _item_dir(self, batch_id: str, item_id: str) -> Path:
+        return Path(self.settings.uploads_dir) / "jobs" / batch_id / item_id
+
+    def _cleanup_media(self, batch_id: str, item_id: str) -> None:
         """Delete the per-item upload dir. Terminal outcomes only — never on
-        requeue/cancel, the file must survive for the retry."""
-        if not media_path:
-            return
-        shutil.rmtree(Path(media_path).parent, ignore_errors=True)
+        requeue/cancel, the file(s) must survive for the retry. Safe to call even
+        when the item had no media (nothing to remove, ignore_errors handles it)."""
+        shutil.rmtree(self._item_dir(batch_id, item_id), ignore_errors=True)
+
+    async def _download_item_media(self, batch_id: str, item_id: str, media_urls: list[str]) -> list[str]:
+        """Fetch every media_url for this item, one subdir per url so same-basename
+        files from different CDNs don't collide. Raises MediaDownloadError (from the
+        first failing url) on any failure — caller fails the item, doesn't retry."""
+        base_dir = self._item_dir(batch_id, item_id)
+
+        async def _dl(index: int, url: str) -> str:
+            dest_dir = base_dir / str(index)
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            path = await download_media(
+                url,
+                dest_dir,
+                max_bytes=self.settings.media_url_max_bytes,
+                timeout_seconds=self.settings.media_url_download_timeout_seconds,
+            )
+            return str(path)
+
+        return await asyncio.gather(*(_dl(i, u) for i, u in enumerate(media_urls)))
 
     async def _process_item(self, batch_id: str, item_id: str, entry: str) -> None:
         item = await self.store.get_item_raw(batch_id, item_id)
@@ -131,6 +154,7 @@ class JobWorkerPool:
 
         req = GenerateRequest.model_validate_json(item["request"])
         media_path = item.get("media_path") or None
+        media_urls = json.loads(item["media_urls"]) if item.get("media_urls") else None
 
         provider = self.providers.get(req.provider)
         if provider is None:
@@ -138,12 +162,27 @@ class JobWorkerPool:
                 batch_id, item_id, entry, success=False,
                 error=f"Unknown provider '{req.provider}'", error_code="unknown_provider",
             )
-            self._cleanup_media(media_path)
+            self._cleanup_media(batch_id, item_id)
             return
 
         await self.store.mark_running(batch_id, item_id)
         attempts = int(item.get("attempts", 0))
         capacity_retries = int(item.get("capacity_retries", 0))
+
+        # Downloaded once per _process_item call, reused across the retry loop below
+        # (in-process only — a crash + reaper requeue just redownloads, which is fine
+        # since the url is still good; not worth persisting to Redis for that case).
+        media_paths: Optional[list[str]] = None
+        if media_urls:
+            try:
+                media_paths = await self._download_item_media(batch_id, item_id, media_urls)
+            except MediaDownloadError as e:
+                await self.store.finish_item(
+                    batch_id, item_id, entry, success=False,
+                    error=str(e), error_code="media_fetch_failed",
+                )
+                self._cleanup_media(batch_id, item_id)
+                return
 
         while True:
             try:
@@ -157,6 +196,7 @@ class JobWorkerPool:
                     usage_logger=self.usage_logger,
                     settings=self.settings,
                     media_path=media_path,
+                    media_paths=media_paths,
                     deadline_seconds=self.settings.jobs_item_deadline_seconds,
                 )
                 await self.store.finish_item(
@@ -171,7 +211,7 @@ class JobWorkerPool:
                         "attempts": attempts + 1,
                     },
                 )
-                self._cleanup_media(media_path)
+                self._cleanup_media(batch_id, item_id)
                 return
 
             except (PoolExhaustedHTTPError, AllKeysDeadHTTPError) as e:
@@ -185,7 +225,7 @@ class JobWorkerPool:
                         batch_id, item_id, entry, success=False,
                         error=e.detail, error_code=code,
                     )
-                    self._cleanup_media(media_path)
+                    self._cleanup_media(batch_id, item_id)
                     return
                 delay = min(
                     getattr(e, "retry_after_seconds", self.settings.jobs_retry_delay_seconds),
@@ -206,7 +246,7 @@ class JobWorkerPool:
                         batch_id, item_id, entry, success=False,
                         error=str(e), error_code="generate_failed",
                     )
-                    self._cleanup_media(media_path)
+                    self._cleanup_media(batch_id, item_id)
                     return
                 await self.store.refresh_lease(batch_id, item_id)
                 await self._wait_or_stop(self.settings.jobs_retry_delay_seconds)

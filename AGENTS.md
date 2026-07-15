@@ -30,6 +30,11 @@ curl -X POST localhost:8080/v1/generate/media \
   -F 'payload={"prompt":"describe this image"};type=application/json' \
   -F 'file=@photo.jpg'
 
+# Or skip the multipart upload entirely — gateway fetches the file(s) itself:
+curl -X POST localhost:8080/v1/generate/media/url \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"describe this image","media_urls":["https://cdn.example.com/photo.jpg"]}'
+
 curl localhost:8080/v1/pool/status
 curl localhost:8080/v1/keys
 curl localhost:8080/v1/usage/summary
@@ -37,8 +42,12 @@ curl localhost:8080/health/ready
 
 # Batch jobs (async, parallel across the key pool — poll for results):
 curl -X POST localhost:8080/v1/jobs -H 'Content-Type: application/json' \
-  -d '{"items": [{"item_id": "a", "prompt": "one"}, {"item_id": "b", "prompt": "two", "has_media": true}]}'
-curl -X POST localhost:8080/v1/jobs/{batch_id}/items/b/media -F 'file=@reel.mp4'
+  -d '{"items": [
+    {"item_id": "a", "prompt": "one"},
+    {"item_id": "b", "prompt": "two", "has_media": true},
+    {"item_id": "c", "prompt": "three", "media_urls": ["https://cdn.example.com/c.mp4"]}
+  ]}'
+curl -X POST localhost:8080/v1/jobs/{batch_id}/items/b/media -F 'file=@reel.mp4'  # only needed for has_media items — "c" above is already queued
 curl localhost:8080/v1/jobs/{batch_id}
 curl localhost:8080/v1/jobs   # list every batch still tracked (summary only)
 ```
@@ -94,6 +103,43 @@ gemini/
   `close_redis()`. Refresh the item lease before any retry sleep or the reaper steals
   the item. Batch media under `UPLOADS_DIR/jobs/` is the one non-Redis piece of shared
   state (host-local); delete only on terminal success/failure.
+- **`JobItemSpec.media_urls`** (mutually exclusive with `has_media`) queues the item
+  immediately — no `awaiting_media` wait, no follow-up multipart call.
+  `JobWorkerPool._download_item_media()` fetches the urls (via `app/media_fetch.py`,
+  same limits as the sync endpoint) right before the retry loop in `_process_item()`,
+  once per call — NOT persisted to Redis, so a crash + reaper requeue just redownloads
+  (acceptable; the url is still valid). A download failure finishes the item as
+  `media_fetch_failed` immediately, deliberately outside the normal
+  `jobs_item_max_attempts` retry budget — a bad url isn't a transient generate error,
+  don't route it through that retry path (mirrors the sync endpoint's non-retry stance).
+- **`/v1/generate/media/url`** (`app/media_fetch.py`) downloads one or more
+  client-supplied CDN urls (`media_urls: list[str]`, capped by `media_url_max_count`)
+  server-side instead of the caller pushing raw bytes through multipart, then feeds
+  the whole batch through the same `run_generate`/`GenerateContext.media_paths`
+  pipeline `/v1/generate/media` uses. Downloads run concurrently, each bounded by
+  `media_url_max_bytes`/`media_url_download_timeout_seconds` (streamed, enforced even
+  if the server lies about `Content-Length`) — one failed url fails the whole request
+  (`422 media_fetch_failed`), it does not silently drop that file. No private-IP/SSRF
+  allowlist in v1 (applies to both this endpoint and `JobItemSpec.media_urls`, same
+  `app/media_fetch.py` code path) — trusts the same boundary as the rest of the
+  gateway; add one before exposing either to untrusted callers.
+- **`/v1/generate/media/url`** (`app/media_fetch.py`) downloads one or more
+  client-supplied CDN urls (`media_urls: list[str]`, capped by `media_url_max_count`)
+  server-side instead of the caller pushing raw bytes through multipart, then feeds
+  the whole batch through the same `run_generate`/`GenerateContext.media_paths`
+  pipeline `/v1/generate/media` uses. Downloads run concurrently, each bounded by
+  `media_url_max_bytes`/`media_url_download_timeout_seconds` (streamed, enforced even
+  if the server lies about `Content-Length`) — one failed url fails the whole request
+  (`422 media_fetch_failed`), it does not silently drop that file. No private-IP/SSRF
+  allowlist in v1 — this endpoint trusts the same boundary as the rest of the gateway;
+  add one before exposing it to untrusted callers.
+- **`GenerateContext.media_paths` is a list, not a single path** — `Provider.generate()`
+  implementations must iterate it (pairing each path with `ctx.extra["uploaded_refs"]`
+  when a File-API ref exists for that path, else treating it as inline media) rather
+  than assuming exactly one file. `run_generate()` still accepts a single `media_path`
+  kwarg for existing single-file callers (`/v1/generate/media`, jobs worker) and
+  normalizes it into the same list internally — a new provider only needs to handle
+  the list form.
 - **New provider checklist**: implement `Provider` ABC (`app/providers/base.py`),
   register in `app/providers/registry.py`'s `_BUILDERS`, add a section to
   `config/models.yaml`, wire its key env var in `app/main.py`. Nothing else changes.

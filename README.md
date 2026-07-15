@@ -84,8 +84,11 @@ docker compose up --build
 | `ACQUIRE_KEY_MAX_WAIT_SECONDS` | `10.0` | How long a request will wait internally for a key to free up before the HTTP handler gives up and returns `429` with `Retry-After`. Deliberately short — see design note below. |
 | `MODELS_CONFIG_PATH` | `config/models.yaml` | Model priority/aliases/quota table per provider. |
 | `LOG_DIR` | `tmp/ai/logs` | Durable JSONL call log + error log + app log. |
-| `UPLOADS_DIR` | `tmp/ai/uploads` | Scratch space for `/v1/generate/media` uploads; cleaned up per-request. |
+| `UPLOADS_DIR` | `tmp/ai/uploads` | Scratch space for `/v1/generate/media` and `/v1/generate/media/url` uploads/downloads; cleaned up per-request. |
 | `LOG_FULL_PAYLOADS` | `false` | When true, also persist full request/response payloads per request under `tmp/ai/logs/requests/`. Off by default (prompts/media may be large or sensitive). |
+| `MEDIA_URL_MAX_BYTES` | `52428800` (50MB) | Max size the gateway will download for each `media_urls` entry, enforced while streaming. |
+| `MEDIA_URL_DOWNLOAD_TIMEOUT_SECONDS` | `30.0` | Timeout for each server-side `media_urls` fetch. |
+| `MEDIA_URL_MAX_COUNT` | `10` | Max number of urls accepted in one `/v1/generate/media/url` request; downloads run concurrently. |
 
 ## API reference
 
@@ -122,6 +125,39 @@ curl -s -X POST localhost:8080/v1/generate/media \
   -F 'file=@photo.jpg' | jq .
 ```
 
+### `POST /v1/generate/media/url`
+
+Same as `/v1/generate/media`, but for media already hosted somewhere reachable (a CDN,
+S3, etc.) — send the url(s) instead of the bytes and the gateway downloads them
+server-side, in parallel. Avoids the client pulling media down just to push it right
+back up to us, which matters for large video on constrained networks.
+
+Body: `{provider?, prompt?, parts?, model?, max_retries?, timeout_seconds?, verbose?,
+metadata?, media_urls}` (`media_urls`: non-empty list of urls, required, `422`
+otherwise; capped at `MEDIA_URL_MAX_COUNT` entries).
+
+```bash
+# single url
+curl -s -X POST localhost:8080/v1/generate/media/url \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"describe this image","media_urls":["https://cdn.example.com/photo.jpg"]}' | jq .
+
+# multiple urls — all attached to the same generate call
+curl -s -X POST localhost:8080/v1/generate/media/url \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"compare these","media_urls":["https://cdn.example.com/a.jpg","https://cdn.example.com/b.jpg"]}' | jq .
+```
+
+Each download is bounded by `MEDIA_URL_MAX_BYTES` (default 50MB, enforced while
+streaming even if the server lies about `Content-Length`) and
+`MEDIA_URL_DOWNLOAD_TIMEOUT_SECONDS` (default 30s); the list itself is capped by
+`MEDIA_URL_MAX_COUNT` (default 10). A bad/unreachable url, wrong scheme, timeout, or
+oversized body on *any* entry fails the whole request with
+`422 {"error": "media_fetch_failed", "detail": "..."}` — not a pool/quota error, since
+the problem is a caller-supplied url, not key/model state. No private-IP/SSRF
+allowlist in v1 (see "Not yet done" below) — only add this endpoint to a deployment
+where callers are already trusted to the same degree as the rest of the gateway.
+
 ### Batch jobs API (async, parallel)
 
 For fan-out workloads (e.g. "describe these 36 reels"), don't hold 36 HTTP connections —
@@ -129,12 +165,18 @@ submit a batch, let the gateway's internal worker pool (`JOBS_WORKER_CONCURRENCY
 20 asyncio workers) process items in parallel across the whole key pool, and poll:
 
 1. **`POST /v1/jobs`** — JSON `{provider?, model?, items: [{item_id?, prompt|parts,
-   model?, timeout_seconds?, metadata?, has_media?}]}` → `201 {batch_id, total, items}`.
-   Text-only items are queued immediately; `has_media: true` items wait in
-   `awaiting_media`. Queue full → `429` with `retry_after_seconds` + `Retry-After`.
+   model?, timeout_seconds?, metadata?, has_media?, media_urls?}]}` →
+   `201 {batch_id, total, items}`. Text-only items are queued immediately;
+   `has_media: true` items wait in `awaiting_media` for a follow-up upload (step 2);
+   `media_urls: [...]` items are ALSO queued immediately — no follow-up call, the
+   worker downloads them itself right before generating (see below). `has_media` and
+   `media_urls` are mutually exclusive on one item (`422` if both set). Each item's
+   `media_urls` list is capped at `MEDIA_URL_MAX_COUNT`. Queue full → `429` with
+   `retry_after_seconds` + `Retry-After`.
 2. **`POST /v1/jobs/{batch_id}/items/{item_id}/media`** — multipart `file`, one call per
-   media item. Flips the item to `queued`; processing starts immediately (no need to
-   finish all uploads first). `409` if the item isn't awaiting media.
+   `has_media` item (skip this entirely for `media_urls` items). Flips the item to
+   `queued`; processing starts immediately (no need to finish all uploads first). `409`
+   if the item isn't awaiting media.
 3. **`GET /v1/jobs/{batch_id}`** — `{status, counts, items: [...]}` in submit order.
    Poll until `status == "completed"`. Succeeded items carry `text`/token counts;
    failed items carry `error` + `error_code` (`generate_failed` | `pool_exhausted` |
@@ -146,12 +188,18 @@ submit a batch, let the gateway's internal worker pool (`JOBS_WORKER_CONCURRENCY
    detail. Use this to see everything the gateway is currently handling without
    knowing a `batch_id` up front.
 
-Item lifecycle: `awaiting_media → queued → running → succeeded | failed`. Each item runs
-through the same `run_generate` pipeline as the sync endpoint (key rotation, same-key
-media pinning, timeouts, tracking) with a wider per-attempt deadline
-(`JOBS_ITEM_DEADLINE_SECONDS`, default 300s — no HTTP client is waiting). Failed attempts
-retry server-side: real failures up to `JOBS_ITEM_MAX_ATTEMPTS` (3), pool-capacity waits
-on a separate `JOBS_CAPACITY_MAX_RETRIES` (10) budget honoring `retry_after_seconds`.
+Item lifecycle: `awaiting_media → queued → running → succeeded | failed` (`has_media`
+items) or `queued → running → succeeded | failed` (text-only and `media_urls` items —
+no upload step to wait on). Each item runs through the same generate pipeline as the
+sync endpoint (key rotation, same-key File-API media pinning, timeouts, tracking) with a
+wider per-attempt deadline (`JOBS_ITEM_DEADLINE_SECONDS`, default 300s — no HTTP client
+is waiting). Failed attempts retry server-side: real failures up to
+`JOBS_ITEM_MAX_ATTEMPTS` (3), pool-capacity waits on a separate
+`JOBS_CAPACITY_MAX_RETRIES` (10) budget honoring `retry_after_seconds`. `media_urls`
+downloads are the one exception to that retry policy — a bad/unreachable url fails the
+item immediately (`error_code: media_fetch_failed`, no retry), same non-retry stance as
+the sync `/v1/generate/media/url` endpoint, since a bad url is a caller-input problem,
+not a transient generate failure.
 
 Reliability: queue and all job state live in Redis (`jobs:queue` → `LMOVE` →
 `jobs:processing` + per-item lease). A crashed worker's items are requeued by a reaper
@@ -277,9 +325,45 @@ client — no network calls or real API keys required.
 - No hot-reload of `config/models.yaml` — restart the service after editing it.
 - Only the `Provider` interface + Gemini implementation exist; a second provider
   (Anthropic, etc.) is future work.
+- `/v1/generate/media/url` and batch jobs' `media_urls` have no private-IP/SSRF
+  allowlist — they trust callers to the same degree as the rest of the gateway. Add
+  DNS-resolve + reject-private-ranges (`app/media_fetch.py`) before exposing either to
+  untrusted clients.
+- A crashed worker + reaper requeue on a `media_urls` item redownloads all of that
+  item's urls from scratch (the downloaded paths only live in the worker's local
+  `_process_item` scope, not persisted to Redis) — acceptable since the source urls are
+  still valid, just extra network cost. Would need a `media_paths` field on the item
+  hash to avoid it, not done since crash-mid-item is rare.
 
 ## Recent changes
 
+- **`media_urls` support in batch jobs** (2026-07-15): `JobItemSpec` gained a
+  `media_urls: list[str]` field, mutually exclusive with `has_media`. Unlike
+  `has_media` items (which sit in `awaiting_media` until a separate multipart upload
+  call), `media_urls` items are queued immediately at submit — `JobWorkerPool`
+  downloads the urls itself (concurrently, same `app/media_fetch.py` used by the sync
+  endpoint) right before calling generate, into `UPLOADS_DIR/jobs/{batch_id}/{item_id}/`
+  (cleaned up on terminal success/failure like existing media items). This is the actual
+  fix for large-media-over-the-network in the case that matters most — fan-out batches
+  — since it removes the per-item upload round-trip entirely. A failed download fails
+  that item immediately (`error_code: media_fetch_failed`) rather than burning the
+  normal generate-failure retry budget, since a bad url isn't a transient error.
+- **`POST /v1/generate/media/url`** (2026-07-15): clients can now send JSON
+  `media_urls` (e.g. CDN links) instead of uploading raw files — the gateway
+  downloads them server-side, concurrently (streamed, size/timeout-bounded per-url via
+  `MEDIA_URL_MAX_BYTES`/`MEDIA_URL_DOWNLOAD_TIMEOUT_SECONDS`, count-capped via
+  `MEDIA_URL_MAX_COUNT`) into the same per-request upload dir `/v1/generate/media`
+  already uses, then runs the same generate pipeline. New endpoint rather than a mode
+  switch on the existing multipart endpoint, to avoid entangling two very different
+  request shapes (`multipart/form-data` vs JSON body) in one handler. Required
+  generalizing `GenerateContext.media_path` (singular) into `media_paths: list[str]`
+  plus per-path upload-ref tracking in `run_generate`/`GeminiProvider.generate`, so a
+  single call can mix File-API-uploaded and inline media — existing single-file callers
+  (`/v1/generate/media`, jobs worker) are unaffected, they just populate a one-item
+  list under the hood. One failed url fails the whole request
+  (`422 media_fetch_failed`), not a pool/quota error. This generalization is what made
+  the batch-jobs `media_urls` support above straightforward to add on top. 86 tests
+  total.
 - **Model-wide circuit breaker** (2026-07-13): production job (27-key pool) sat on one
   rate-limited preview model for 15+ minutes instead of falling back — per-key cooldowns
   only ever cooled the one key that failed, so a large pool kept finding another

@@ -8,17 +8,18 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Form, Request, UploadFile
+from fastapi import APIRouter, Form, HTTPException, Request, UploadFile
 
 from app.config import Settings
 from app.deps import get_call_tracker, get_key_pool, get_provider, get_rate_limiter, get_settings, get_usage_logger
-from app.errors import AllKeysDeadHTTPError, PoolExhaustedHTTPError
+from app.errors import AllKeysDeadHTTPError, MediaFetchHTTPError, PoolExhaustedHTTPError
+from app.media_fetch import MediaDownloadError, download_media
 from app.models.enums import FailureReason
-from app.models.requests import GenerateRequest
+from app.models.requests import GenerateMediaUrlRequest, GenerateRequest
 from app.models.responses import GenerateResponse
 from app.pool.key_pool import AsyncAPIKeyPool
 from app.pool.redis_keys import key_suffix
-from app.providers.base import GenerateContext, Provider
+from app.providers.base import GenerateContext, Provider, UploadedMediaRef
 from app.rate_limit.limiter import RateLimiter
 from app.tracking.call_tracker import CallTracker
 from app.tracking.usage_logger import UsageLogger
@@ -58,14 +59,19 @@ async def run_generate(
     usage_logger: UsageLogger,
     settings: Settings,
     media_path: Optional[str] = None,
+    media_paths: Optional[list[str]] = None,
     deadline_seconds: Optional[float] = None,
 ) -> GenerateResponse:
     model = provider.resolve_model(req.model)
     max_retries = max(req.max_retries, pool.size() + 5)
     prompt_parts = req.parts_as_dicts()
 
-    requires_upload = bool(media_path) and await provider.requires_file_upload(media_path)
-    uploaded_ref = None
+    # media_path (single file) and media_paths (zero or more) are two ways of feeding
+    # the same normalized `paths` list below — callers only ever pass one or the other.
+    paths: list[str] = media_paths if media_paths else ([media_path] if media_path else [])
+    requires_upload_by_path = {p: await provider.requires_file_upload(p) for p in paths}
+    any_requires_upload = any(requires_upload_by_path.values())
+    uploaded_refs: dict[str, UploadedMediaRef] = {}
     uploaded_ref_key: Optional[str] = None
 
     # Per-generate timeout: honor the caller's value, else fall back to the server
@@ -106,40 +112,57 @@ async def run_generate(
 
                 # Gemini File API refs are scoped to the uploading key's project, so
                 # upload and generate MUST use the same key — otherwise generate gets a
-                # 403 "permission to access the File". Upload (or re-upload) under the
-                # currently-leased key whenever we don't hold a ref for this exact key.
-                if requires_upload and uploaded_ref_key != key:
-                    if uploaded_ref is not None and uploaded_ref_key:
-                        await provider.delete_uploaded_media(uploaded_ref, uploaded_ref_key)
-                        uploaded_ref = None
-                        uploaded_ref_key = None
-                    try:
-                        uploaded_ref = await provider.upload_media(media_path, key)
-                        uploaded_ref_key = key
-                        await tracker.record_call(
-                            provider.name, "upload", attempt_model, key_suffix(key), True, "uploaded", total_tokens=0
-                        )
-                    except Exception as upload_err:
-                        message = str(upload_err)
-                        await tracker.record_call(
-                            provider.name, "upload", attempt_model, key_suffix(key), False, message, total_tokens=0
-                        )
-                        classification = provider.classify_error(message)
-                        await pool.report_failure(key, attempt_model, classification, tracker=tracker)
-                        usage_logger.log_call(
-                            request_id=request_id,
-                            service=provider.name,
-                            method="upload",
-                            model=attempt_model,
-                            quota_model=tracker.resolve_model(attempt_model),
-                            api_key_suffix=key_suffix(key),
-                            success=False,
-                            input_tokens=None,
-                            output_tokens=None,
-                            total_tokens=None,
-                            error=message,
-                        )
+                # 403 "permission to access the File". (Re-)upload every file that needs
+                # it under the currently-leased key whenever we don't hold refs for this
+                # exact key yet.
+                if any_requires_upload and uploaded_ref_key != key:
+                    if uploaded_refs and uploaded_ref_key:
+                        for stale_ref in uploaded_refs.values():
+                            await provider.delete_uploaded_media(stale_ref, uploaded_ref_key)
+                    uploaded_refs = {}
+                    uploaded_ref_key = None
+
+                    upload_failed = False
+                    for p in paths:
+                        if not requires_upload_by_path[p]:
+                            continue
+                        try:
+                            uploaded_refs[p] = await provider.upload_media(p, key)
+                            await tracker.record_call(
+                                provider.name, "upload", attempt_model, key_suffix(key), True, "uploaded", total_tokens=0
+                            )
+                        except Exception as upload_err:
+                            message = str(upload_err)
+                            await tracker.record_call(
+                                provider.name, "upload", attempt_model, key_suffix(key), False, message, total_tokens=0
+                            )
+                            classification = provider.classify_error(message)
+                            await pool.report_failure(key, attempt_model, classification, tracker=tracker)
+                            usage_logger.log_call(
+                                request_id=request_id,
+                                service=provider.name,
+                                method="upload",
+                                model=attempt_model,
+                                quota_model=tracker.resolve_model(attempt_model),
+                                api_key_suffix=key_suffix(key),
+                                success=False,
+                                input_tokens=None,
+                                output_tokens=None,
+                                total_tokens=None,
+                                error=message,
+                            )
+                            upload_failed = True
+                            break
+
+                    if upload_failed:
+                        # Drop whatever succeeded this attempt so the next attempt (same
+                        # or different key) starts clean instead of mixing key scopes.
+                        for ref in uploaded_refs.values():
+                            await provider.delete_uploaded_media(ref, key)
+                        uploaded_refs = {}
                         continue
+
+                    uploaded_ref_key = key
 
                 if rate_limiter:
                     await rate_limiter.wait_if_needed(key)
@@ -147,13 +170,13 @@ async def run_generate(
                 ctx = GenerateContext(
                     prompt_text=req.prompt,
                     prompt_parts=prompt_parts,
-                    media_path=media_path if uploaded_ref is None else None,
+                    media_paths=paths,
                     model=attempt_model,
                     api_key=key,
                     timeout_seconds=effective_timeout,
                     verbose=req.verbose,
                     request_id=request_id,
-                    extra={"uploaded_ref": uploaded_ref} if uploaded_ref is not None else {},
+                    extra={"uploaded_refs": uploaded_refs} if uploaded_refs else {},
                 )
 
                 result = await provider.generate(ctx)
@@ -224,22 +247,24 @@ async def run_generate(
 
                 if (
                     classification.reason in (FailureReason.STALE_MEDIA, FailureReason.AUTH_DEAD)
-                    and uploaded_ref is not None
+                    and uploaded_refs
                 ):
-                    # Stale/expired file ref or a dead key — drop the ref so the next
+                    # Stale/expired file ref(s) or a dead key — drop them so the next
                     # attempt re-uploads under a fresh key. STALE_MEDIA does not cool the
                     # key (see report_failure), so a cross-key 403 no longer kills the pool.
                     if uploaded_ref_key:
-                        await provider.delete_uploaded_media(uploaded_ref, uploaded_ref_key)
-                    uploaded_ref = None
+                        for ref in uploaded_refs.values():
+                            await provider.delete_uploaded_media(ref, uploaded_ref_key)
+                    uploaded_refs = {}
                     uploaded_ref_key = None
                 elif classification.reason in (FailureReason.RATE_LIMIT, FailureReason.HIGH_DEMAND):
                     if attempt < max_retries - 1:
                         await asyncio.sleep(1)
-                    if requires_upload and uploaded_ref is not None:
+                    if any_requires_upload and uploaded_refs:
                         if uploaded_ref_key:
-                            await provider.delete_uploaded_media(uploaded_ref, uploaded_ref_key)
-                        uploaded_ref = None
+                            for ref in uploaded_refs.values():
+                                await provider.delete_uploaded_media(ref, uploaded_ref_key)
+                        uploaded_refs = {}
                         uploaded_ref_key = None
 
                 if attempt >= max_retries - 1:
@@ -252,8 +277,9 @@ async def run_generate(
         await _raise_pool_error(pool, request_id, provider.name)
         raise AllKeysDeadHTTPError(request_id=request_id)
     finally:
-        if uploaded_ref is not None and uploaded_ref_key:
-            await provider.delete_uploaded_media(uploaded_ref, uploaded_ref_key)
+        if uploaded_refs and uploaded_ref_key:
+            for ref in uploaded_refs.values():
+                await provider.delete_uploaded_media(ref, uploaded_ref_key)
 
 
 @router.post("/generate", response_model=GenerateResponse)
@@ -312,6 +338,63 @@ async def generate_media(
             usage_logger=usage_logger,
             settings=settings,
             media_path=str(media_path),
+        )
+    finally:
+        shutil.rmtree(upload_dir, ignore_errors=True)
+
+
+@router.post("/generate/media/url", response_model=GenerateResponse)
+async def generate_media_url(request: Request, req: GenerateMediaUrlRequest) -> GenerateResponse:
+    """Same as /generate/media, but the caller sends one or more CDN urls instead of
+    the raw bytes — the gateway downloads them server-side. Avoids clients pushing
+    large media through the request body just to hand it back to us."""
+    provider = get_provider(request, req.provider)
+    pool = get_key_pool(request, req.provider)
+    tracker = get_call_tracker(request, req.provider)
+    rate_limiter = get_rate_limiter(request, req.provider)
+    usage_logger = get_usage_logger(request)
+    settings: Settings = get_settings(request)
+
+    if len(req.media_urls) > settings.media_url_max_count:
+        raise HTTPException(
+            status_code=422,
+            detail=f"media_urls exceeds media_url_max_count ({settings.media_url_max_count}).",
+        )
+
+    request_id = uuid.uuid4().hex
+    upload_dir = Path(settings.uploads_dir) / request_id
+    upload_dir.mkdir(parents=True, exist_ok=True)
+
+    async def _download_one(index: int, url: str) -> Path:
+        # One subdir per url so same-named files from different CDNs (e.g. two
+        # "image.jpg") don't collide.
+        dest_dir = upload_dir / str(index)
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            return await download_media(
+                url,
+                dest_dir,
+                max_bytes=settings.media_url_max_bytes,
+                timeout_seconds=settings.media_url_download_timeout_seconds,
+            )
+        except MediaDownloadError as e:
+            raise MediaFetchHTTPError(request_id=request_id, detail=f"{url}: {e}") from e
+
+    try:
+        media_paths = await asyncio.gather(
+            *(_download_one(i, url) for i, url in enumerate(req.media_urls))
+        )
+
+        return await run_generate(
+            request_id=request_id,
+            req=req,
+            provider=provider,
+            pool=pool,
+            tracker=tracker,
+            rate_limiter=rate_limiter,
+            usage_logger=usage_logger,
+            settings=settings,
+            media_paths=[str(p) for p in media_paths],
         )
     finally:
         shutil.rmtree(upload_dir, ignore_errors=True)

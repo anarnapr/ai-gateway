@@ -38,10 +38,12 @@ class JobStore:
     # ---------- submit ----------
 
     async def create_batch(self, provider: str, items: list[dict[str, Any]]) -> tuple[str, list[tuple[str, str]]]:
-        """items: [{item_id, request_json, metadata, has_media}, ...] (item_id already
-        assigned/deduped by the endpoint). Returns (batch_id, [(item_id, status)]).
-        Items without media are enqueued immediately; media items wait in
-        awaiting_media until their upload arrives.
+        """items: [{item_id, request_json, metadata, has_media, media_urls}, ...]
+        (item_id already assigned/deduped by the endpoint). Returns (batch_id,
+        [(item_id, status)]). Items without media, and items with media_urls (the
+        worker downloads those itself before generating), are enqueued immediately;
+        only has_media items wait in awaiting_media until their multipart upload
+        arrives.
         """
         batch_id = uuid.uuid4().hex
         now = time.time()
@@ -85,6 +87,8 @@ class JobStore:
             }
             if it.get("metadata") is not None:
                 mapping["metadata"] = json.dumps(it["metadata"])
+            if it.get("media_urls"):
+                mapping["media_urls"] = json.dumps(it["media_urls"])
             pipe.hset(item_key, mapping=mapping)
             pipe.expire(item_key, initial_ttl)
             pipe.rpush(self.rk.jobs_batch_items(batch_id), item_id)

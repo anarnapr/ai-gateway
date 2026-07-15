@@ -115,13 +115,15 @@ class GeminiProvider(Provider):
         if ctx.prompt_parts:
             content_to_send.extend(self._convert_parts(ctx.prompt_parts))
 
-        uploaded_ref: Optional[UploadedMediaRef] = ctx.extra.get("uploaded_ref")
-        if uploaded_ref is not None:
-            content_to_send.append(uploaded_ref.handle)
-        elif ctx.media_path:
-            inline_part = self._create_inline_media_part(ctx.media_path)
-            if inline_part:
-                content_to_send.append(inline_part)
+        uploaded_refs: dict[str, UploadedMediaRef] = ctx.extra.get("uploaded_refs") or {}
+        for media_path in ctx.media_paths:
+            ref = uploaded_refs.get(media_path)
+            if ref is not None:
+                content_to_send.append(ref.handle)
+            else:
+                inline_part = self._create_inline_media_part(media_path)
+                if inline_part:
+                    content_to_send.append(inline_part)
 
         if ctx.prompt_text:
             content_to_send.append(ctx.prompt_text)

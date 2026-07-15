@@ -36,6 +36,12 @@ async def submit_batch(request: Request, req: JobSubmitRequest) -> JobSubmitResp
         )
     if get_provider_registry(request).get(req.provider) is None:
         raise HTTPException(status_code=422, detail=f"Unknown provider: {req.provider}")
+    for spec in req.items:
+        if spec.media_urls and len(spec.media_urls) > settings.media_url_max_count:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Item '{spec.item_id}' media_urls exceeds media_url_max_count ({settings.media_url_max_count}).",
+            )
 
     enqueueable = sum(1 for it in req.items if not it.has_media)
     if await store.queue_length() + enqueueable > settings.jobs_max_queue_length:
@@ -60,6 +66,7 @@ async def submit_batch(request: Request, req: JobSubmitRequest) -> JobSubmitResp
                 "request_json": gen_req.model_dump_json(exclude_none=True),
                 "metadata": spec.metadata,
                 "has_media": spec.has_media,
+                "media_urls": spec.media_urls,
             }
         )
 

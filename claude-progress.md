@@ -1,7 +1,7 @@
 # claude-progress.md - Status
 
-> Last updated: 2026-07-14 (GET /v1/jobs list-all endpoint added)
-> Status: Batch jobs API complete; production rate-limit incident root-caused and fixed (69 tests green)
+> Last updated: 2026-07-15 (media_urls support: /v1/generate/media/url endpoint + batch jobs JobItemSpec.media_urls)
+> Status: Batch jobs API complete; production rate-limit incident root-caused and fixed (86 tests green)
 
 ## Current State
 `ai-gateway` is a new standalone FastAPI microservice, extracted from
@@ -76,6 +76,55 @@ dicts only worked within a single process.
   `drop_entry`). Returns one summary row per batch (`status`, `total`, `counts`,
   timestamps) — no per-item detail, use the existing per-batch endpoint for that.
 
+- [x] **`POST /v1/generate/media/url`** (2026-07-15): clients were pushing large media
+  through `/v1/generate/media`'s multipart body just so the gateway could turn around
+  and use it — wasteful on constrained client networks when the media already lives on
+  a CDN. Added a JSON sibling endpoint that takes `media_urls` (list, so multiple CDN
+  links can attach to one generate call) and downloads them server-side, concurrently
+  (`app/media_fetch.py`, streamed via `httpx`, each capped by `MEDIA_URL_MAX_BYTES`/
+  `MEDIA_URL_DOWNLOAD_TIMEOUT_SECONDS` even if the server lies about `Content-Length`;
+  list length capped by `MEDIA_URL_MAX_COUNT`) into per-index subdirs under the
+  per-request `UPLOADS_DIR` dir (so same-basename files from different CDNs don't
+  collide), then hands off to the same generate pipeline. Kept as a new endpoint rather
+  than an alternate mode on the existing one — multipart-form and JSON-body are
+  different enough request shapes that branching one handler on payload type would've
+  been messier than two thin handlers sharing `run_generate`. Deliberately no
+  private-IP/SSRF allowlist in v1 (user chose scheme/size/timeout-only guarding); one
+  failed url fails the whole request with `422 media_fetch_failed`, distinct from
+  pool/quota errors (no partial-success silent-drop). Required generalizing
+  `GenerateContext.media_path` (singular) → `media_paths: list[str]` plus per-path
+  `uploaded_refs` tracking through `run_generate`'s upload/retry/cooldown logic and
+  `GeminiProvider.generate`, so one call can mix File-API-uploaded and inline media in
+  any order — `run_generate` still accepts a single `media_path` kwarg for the
+  unchanged single-file callers (`/v1/generate/media`, jobs worker), normalized
+  internally into the same list. 86 tests total (12 new: `tests/test_media_fetch.py`,
+  `tests/test_api_generate_media_url.py`; 2 existing tests in
+  `tests/test_api_generate_media.py`/`tests/test_api_jobs.py` updated for the
+  `ctx.media_paths` list + `ctx.extra["uploaded_refs"]` dict rename).
+- [x] **`media_urls` on batch job items** (2026-07-15): the multi-URL work above made
+  clear that batch jobs — fan-out over many items — is actually the case where the
+  multipart-upload network cost hurts most, more than the single-item sync endpoint.
+  Added `JobItemSpec.media_urls: list[str]`, mutually exclusive with `has_media`
+  (`422` if both set). Unlike `has_media` items, `media_urls` items skip
+  `awaiting_media` entirely and are queued immediately at submit —
+  `JobWorkerPool._download_item_media()` (`app/jobs/worker.py`) downloads them
+  concurrently, once per `_process_item()` call, right before the existing retry loop,
+  into `UPLOADS_DIR/jobs/{batch_id}/{item_id}/{index}/` (reusing `app/media_fetch.py`,
+  same `MEDIA_URL_MAX_BYTES`/`_DOWNLOAD_TIMEOUT_SECONDS`/`_MAX_COUNT` limits as the sync
+  endpoint). Per user's explicit choice: a download failure finishes the item
+  immediately as `error_code: media_fetch_failed`, deliberately bypassing
+  `jobs_item_max_attempts` — a bad url isn't a transient generate error and shouldn't
+  burn/extend that retry budget (same non-retry stance the sync endpoint already took).
+  Downloaded paths are NOT persisted to the item's Redis hash — only kept in the
+  worker's local scope for that `_process_item()` call — so a crash + reaper requeue
+  redownloads from scratch rather than resuming; accepted as fine since the source urls
+  are still valid (see "Known Operational Notes"). `_cleanup_media` was generalized from
+  "delete `Path(media_path).parent`" to "delete `UPLOADS_DIR/jobs/{batch_id}/{item_id}/`
+  unconditionally" so it correctly cleans up whether media arrived via multipart upload
+  or url download. 86 tests total (5 new: 2 in `tests/test_job_worker.py`, 1 rewritten
+  there to match the real per-item dir layout instead of an ad-hoc `tmp_path`; 3 new in
+  `tests/test_api_jobs.py`).
+
 ## Bugs Found & Fixed During Verification
 - [x] **Cooldown classification race**: `classify_key_status` inferred `dead_auth` vs
   `short_cooldown` from remaining cooldown *duration* against a threshold equal to the
@@ -134,6 +183,15 @@ earlier test run) success entry and full error detail captured on failures.
   inefficiency, harden later (retry the GET instead).
 
 ## Not Yet Done
+- **`app/media_fetch.py` (shared by `/v1/generate/media/url` and `JobItemSpec.media_urls`)
+  has no SSRF/private-IP guard** — only scheme + streamed size/timeout limits (user's
+  explicit choice over IP-range blocking). Fine as long as neither is exposed to
+  untrusted callers; add DNS-resolve + reject-private-range checks before either is.
+- **`media_urls` batch job items redownload from scratch on crash + reaper requeue** —
+  the downloaded paths only live in `JobWorkerPool._process_item()`'s local scope, not
+  the item's Redis hash, so a worker crash mid-item means the next attempt refetches
+  every url. Acceptable (urls are still valid; rare case) but a `media_paths` Redis
+  field would avoid the wasted download if this turns out to matter in practice.
 - **No test coverage yet for `GET /v1/jobs`** — the list-all endpoint (see milestone
   above) shipped without a corresponding entry in `tests/test_api_jobs.py`. 69 tests
   total is unchanged from before this endpoint was added.

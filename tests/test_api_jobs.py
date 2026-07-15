@@ -54,7 +54,7 @@ def test_media_item_flow(jobs_api_client, monkeypatch):
         return False  # inline path; media presence is what we're testing
 
     async def fake_generate(self, ctx):
-        assert ctx.media_path is not None
+        assert len(ctx.media_paths) == 1
         return ProviderResult(text="saw media", total_tokens=3)
 
     monkeypatch.setattr(GeminiProvider, "requires_file_upload", fake_requires_upload)
@@ -86,6 +86,72 @@ def test_media_item_flow(jobs_api_client, monkeypatch):
 
     jobs_uploads = Path(get_settings().uploads_dir) / "jobs" / batch_id
     assert not any(jobs_uploads.rglob("*")) if jobs_uploads.exists() else True
+
+
+def test_media_url_item_flow(jobs_api_client, monkeypatch):
+    """media_urls items skip the awaiting_media/upload round-trip entirely — queued
+    immediately at submit, worker downloads before generating."""
+    import app.jobs.worker as worker_module
+
+    async def fake_download_media(url, dest_dir, *, max_bytes, timeout_seconds):
+        path = Path(dest_dir) / "clip.mp4"
+        path.write_bytes(b"\x00fakevid")
+        return path
+
+    async def fake_requires_upload(self, media_path):
+        return False
+
+    async def fake_generate(self, ctx):
+        assert len(ctx.media_paths) == 1
+        return ProviderResult(text="saw media via url", total_tokens=3)
+
+    monkeypatch.setattr(worker_module, "download_media", fake_download_media)
+    monkeypatch.setattr(GeminiProvider, "requires_file_upload", fake_requires_upload)
+    monkeypatch.setattr(GeminiProvider, "generate", fake_generate)
+
+    resp = jobs_api_client.post(
+        "/v1/jobs",
+        json={"items": [{"item_id": "reel1", "prompt": "describe", "media_urls": ["https://cdn.example.com/reel1.mp4"]}]},
+    )
+    assert resp.status_code == 201
+    # Queued immediately — no awaiting_media step, unlike has_media.
+    assert resp.json()["items"][0]["status"] == "queued"
+
+    result = _poll_until_completed(jobs_api_client, resp.json()["batch_id"])
+    assert result["items"][0]["text"] == "saw media via url"
+
+    from app.config import get_settings
+
+    jobs_uploads = Path(get_settings().uploads_dir) / "jobs" / resp.json()["batch_id"]
+    assert not any(jobs_uploads.rglob("*")) if jobs_uploads.exists() else True
+
+
+def test_media_url_and_has_media_are_mutually_exclusive(jobs_api_client):
+    resp = jobs_api_client.post(
+        "/v1/jobs",
+        json={"items": [{"prompt": "p", "has_media": True, "media_urls": ["https://cdn.example.com/a.jpg"]}]},
+    )
+    assert resp.status_code == 422
+
+
+def test_media_urls_over_max_count_returns_422(jobs_api_client):
+    jobs_api_client.app.state.settings.media_url_max_count = 2
+    resp = jobs_api_client.post(
+        "/v1/jobs",
+        json={
+            "items": [
+                {
+                    "prompt": "p",
+                    "media_urls": [
+                        "https://cdn.example.com/a.jpg",
+                        "https://cdn.example.com/b.jpg",
+                        "https://cdn.example.com/c.jpg",
+                    ],
+                }
+            ]
+        },
+    )
+    assert resp.status_code == 422
 
 
 def test_media_upload_conflicts_and_404s(jobs_api_client):

@@ -39,6 +39,15 @@ class JobsQueueFullHTTPError(GatewayError):
         self.retry_after_seconds = retry_after_seconds
 
 
+class MediaFetchHTTPError(GatewayError):
+    """media_url couldn't be downloaded (bad scheme, non-200, too large, timed out).
+    Maps to HTTP 422 — caller-supplied input is the problem, not pool/quota state.
+    """
+
+    def __init__(self, request_id: str, detail: str):
+        super().__init__("media_fetch_failed", detail, request_id)
+
+
 class AllKeysDeadHTTPError(GatewayError):
     """Every configured key is dead_auth/dead_quota, or no keys are configured. Maps to
     HTTP 503 — this is a total outage, not a transient rate limit.
@@ -72,6 +81,11 @@ def register_exception_handlers(app: FastAPI) -> None:
         )
         headers = {"Retry-After": str(max(1, math.ceil(exc.retry_after_seconds)))}
         return JSONResponse(status_code=429, content=body.model_dump(), headers=headers)
+
+    @app.exception_handler(MediaFetchHTTPError)
+    async def _handle_media_fetch_failed(request: Request, exc: MediaFetchHTTPError):
+        body = GenerateErrorResponse(request_id=exc.request_id, error=exc.error, detail=exc.detail)
+        return JSONResponse(status_code=422, content=body.model_dump())
 
     @app.exception_handler(AllKeysDeadHTTPError)
     async def _handle_all_keys_dead(request: Request, exc: AllKeysDeadHTTPError):

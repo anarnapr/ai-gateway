@@ -42,23 +42,29 @@ def _pool(store, settings) -> JobWorkerPool:
     )
 
 
-async def _submit_one(store, media_path: str | None = None) -> tuple[str, str, str]:
+async def _submit_one(store, has_media: bool = False) -> tuple[str, str, str]:
     batch_id, _ = await store.create_batch(
         "gemini",
-        [{"item_id": "it", "request_json": json.dumps({"provider": "gemini", "prompt": "p"}), "metadata": None, "has_media": bool(media_path)}],
+        [{"item_id": "it", "request_json": json.dumps({"provider": "gemini", "prompt": "p"}), "metadata": None, "has_media": has_media}],
     )
-    if media_path:
-        await store.attach_media_and_enqueue(batch_id, "it", media_path)
-    b, item_id, entry = await store.claim_next()
-    return b, item_id, entry
+    if not has_media:
+        b, item_id, entry = await store.claim_next()
+        return b, item_id, entry
+    return batch_id, "it", None  # caller attaches media then claims
 
 
 @pytest.mark.asyncio
-async def test_process_item_success_writes_result_and_cleans_media(store, settings, monkeypatch, tmp_path):
-    media_dir = tmp_path / "it"
-    media_dir.mkdir()
+async def test_process_item_success_writes_result_and_cleans_media(store, settings, monkeypatch):
+    b, item_id, _ = await _submit_one(store, has_media=True)
+
+    # Matches the real per-item layout upload_item_media() writes to.
+    media_dir = Path(settings.uploads_dir) / "jobs" / b / item_id
+    media_dir.mkdir(parents=True)
     media_file = media_dir / "clip.mp4"
     media_file.write_bytes(b"vid")
+
+    await store.attach_media_and_enqueue(b, item_id, str(media_file))
+    _, _, entry = await store.claim_next()
 
     async def fake_run_generate(**kwargs):
         assert kwargs["media_path"] == str(media_file)
@@ -66,7 +72,6 @@ async def test_process_item_success_writes_result_and_cleans_media(store, settin
         return _resp("described")
 
     monkeypatch.setattr(worker_module, "run_generate", fake_run_generate)
-    b, item_id, entry = await _submit_one(store, media_path=str(media_file))
 
     await _pool(store, settings)._process_item(b, item_id, entry)
 
@@ -77,6 +82,81 @@ async def test_process_item_success_writes_result_and_cleans_media(store, settin
     assert not media_dir.exists()  # per-item upload dir removed
     batch = await store.get_batch_status(b)
     assert batch["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_process_item_downloads_media_urls_before_generate_and_cleans_up(store, settings, monkeypatch):
+    async def fake_download_media(url, dest_dir, *, max_bytes, timeout_seconds):
+        path = Path(dest_dir) / "photo.jpg"
+        path.write_bytes(b"fake-bytes")
+        return path
+
+    monkeypatch.setattr(worker_module, "download_media", fake_download_media)
+
+    async def fake_run_generate(**kwargs):
+        assert kwargs["media_path"] is None
+        assert kwargs["media_paths"] and len(kwargs["media_paths"]) == 2
+        return _resp("described 2 images")
+
+    monkeypatch.setattr(worker_module, "run_generate", fake_run_generate)
+
+    batch_id, _ = await store.create_batch(
+        "gemini",
+        [{
+            "item_id": "it",
+            "request_json": json.dumps({"provider": "gemini", "prompt": "p"}),
+            "metadata": None,
+            "has_media": False,
+            "media_urls": ["https://cdn.example.com/a.jpg", "https://cdn.example.com/b.jpg"],
+        }],
+    )
+    b, item_id, entry = await store.claim_next()
+
+    await _pool(store, settings)._process_item(b, item_id, entry)
+
+    item = await store.get_item(b, item_id)
+    assert item["status"] == ItemStatus.SUCCEEDED.value
+    assert item["text"] == "described 2 images"
+    media_dir = Path(settings.uploads_dir) / "jobs" / b / item_id
+    assert not media_dir.exists()  # downloaded files cleaned up
+
+
+@pytest.mark.asyncio
+async def test_process_item_media_url_download_failure_fails_item_without_retry(store, settings, monkeypatch):
+    from app.media_fetch import MediaDownloadError
+
+    calls = {"download": 0}
+
+    async def fake_download_media(url, dest_dir, *, max_bytes, timeout_seconds):
+        calls["download"] += 1
+        raise MediaDownloadError("media_url returned HTTP 404")
+
+    monkeypatch.setattr(worker_module, "download_media", fake_download_media)
+
+    async def fail_if_called(**kwargs):
+        raise AssertionError("run_generate should not be called when media download fails")
+
+    monkeypatch.setattr(worker_module, "run_generate", fail_if_called)
+
+    batch_id, _ = await store.create_batch(
+        "gemini",
+        [{
+            "item_id": "it",
+            "request_json": json.dumps({"provider": "gemini", "prompt": "p"}),
+            "metadata": None,
+            "has_media": False,
+            "media_urls": ["https://cdn.example.com/missing.jpg"],
+        }],
+    )
+    b, item_id, entry = await store.claim_next()
+
+    await _pool(store, settings)._process_item(b, item_id, entry)
+
+    item = await store.get_item(b, item_id)
+    assert item["status"] == ItemStatus.FAILED.value
+    assert item["error_code"] == "media_fetch_failed"
+    assert "404" in item["error"]
+    assert calls["download"] == 1  # not retried
 
 
 @pytest.mark.asyncio
