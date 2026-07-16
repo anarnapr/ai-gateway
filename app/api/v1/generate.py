@@ -137,7 +137,9 @@ async def run_generate(
                                 provider.name, "upload", attempt_model, key_suffix(key), False, message, total_tokens=0
                             )
                             classification = provider.classify_error(message)
-                            await pool.report_failure(key, attempt_model, classification, tracker=tracker)
+                            await pool.report_failure(
+                                key, attempt_model, classification, tracker=tracker, service=provider.name
+                            )
                             usage_logger.log_call(
                                 request_id=request_id,
                                 service=provider.name,
@@ -191,6 +193,7 @@ async def run_generate(
                     input_tokens=result.input_tokens,
                     output_tokens=result.output_tokens,
                     total_tokens=result.total_tokens,
+                    latency_ms=(time.monotonic() - start_time) * 1000,
                 )
                 await pool.record_success(key, attempt_model)
                 usage_logger.log_call(
@@ -230,7 +233,9 @@ async def run_generate(
                     await tracker.record_call(
                         provider.name, "generate", attempt_model, key_suffix(leased_key), False, message, total_tokens=0
                     )
-                    await pool.report_failure(leased_key, attempt_model, classification, tracker=tracker)
+                    await pool.report_failure(
+                        leased_key, attempt_model, classification, tracker=tracker, service=provider.name
+                    )
                     usage_logger.log_call(
                         request_id=request_id,
                         service=provider.name,

@@ -7,6 +7,9 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from app.models.responses import GenerateErrorResponse, KeyStatusEntry
+from app.pool.redis_keys import RedisKeys
+from app.redis_client import get_redis
+from app.tracking import stats
 
 
 class GatewayError(Exception):
@@ -59,8 +62,11 @@ class AllKeysDeadHTTPError(GatewayError):
 
 
 def register_exception_handlers(app: FastAPI) -> None:
+    rk = RedisKeys()
+
     @app.exception_handler(PoolExhaustedHTTPError)
     async def _handle_pool_exhausted(request: Request, exc: PoolExhaustedHTTPError):
+        await stats.record_http_response(get_redis(), rk, exc.error)
         body = GenerateErrorResponse(
             request_id=exc.request_id,
             error=exc.error,
@@ -73,6 +79,7 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(JobsQueueFullHTTPError)
     async def _handle_queue_full(request: Request, exc: JobsQueueFullHTTPError):
+        await stats.record_http_response(get_redis(), rk, exc.error)
         body = GenerateErrorResponse(
             request_id=exc.request_id,
             error=exc.error,
@@ -84,11 +91,13 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(MediaFetchHTTPError)
     async def _handle_media_fetch_failed(request: Request, exc: MediaFetchHTTPError):
+        await stats.record_http_response(get_redis(), rk, exc.error)
         body = GenerateErrorResponse(request_id=exc.request_id, error=exc.error, detail=exc.detail)
         return JSONResponse(status_code=422, content=body.model_dump())
 
     @app.exception_handler(AllKeysDeadHTTPError)
     async def _handle_all_keys_dead(request: Request, exc: AllKeysDeadHTTPError):
+        await stats.record_http_response(get_redis(), rk, exc.error)
         body = GenerateErrorResponse(
             request_id=exc.request_id,
             error=exc.error,
@@ -99,5 +108,6 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(GatewayError)
     async def _handle_generic(request: Request, exc: GatewayError):
+        await stats.record_http_response(get_redis(), rk, exc.error)
         body = GenerateErrorResponse(request_id=exc.request_id, error=exc.error, detail=exc.detail)
         return JSONResponse(status_code=500, content=body.model_dump())

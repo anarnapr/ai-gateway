@@ -9,6 +9,7 @@ from typing import Any, Optional
 import redis.asyncio as redis
 
 from app.pool.redis_keys import RedisKeys
+from app.tracking import stats
 
 RPD_TTL_SECONDS = 2 * 24 * 3600
 
@@ -122,11 +123,16 @@ class CallTracker:
         input_tokens: Optional[int] = None,
         output_tokens: Optional[int] = None,
         total_tokens: Optional[int] = None,
+        latency_ms: Optional[float] = None,
     ) -> None:
         resolved = self.resolve_model(model) if service == self.service else None
         suffix = api_key_suffix or "????"
         now = time.time()
         today = self._today()
+
+        await stats.record_call_outcome(self.redis, self.rk, service, success)
+        if latency_ms is not None and resolved:
+            await stats.record_latency(self.redis, self.rk, service, resolved, latency_ms)
 
         if resolved:
             token = str(uuid.uuid4())

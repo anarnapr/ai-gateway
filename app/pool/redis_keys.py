@@ -102,3 +102,34 @@ class RedisKeys:
 
     def tracker_failures_day(self, model: str, suffix: str, yyyymmdd: str) -> str:
         return f"{self.prefix}:tracker:failures_day:{model}:{suffix}:{yyyymmdd}"
+
+    # --- Aggregate stats (GET /v1/stats) — day-scoped HASHes, long TTL (see
+    # app/tracking/stats.py STATS_TTL_SECONDS), separate from CallTracker's own
+    # short-TTL quota-window keys above since these are for historical analysis,
+    # not rate-limit enforcement. ---
+
+    def stats_calls(self, service: str, yyyymmdd: str) -> str:
+        """HASH: total, success, failed — every record_call() bumps this."""
+        return f"{self.prefix}:stats:calls:{service}:{yyyymmdd}"
+
+    def stats_failures_by_reason(self, service: str, yyyymmdd: str) -> str:
+        """HASH: FailureReason.value -> count. Bumped in report_failure()."""
+        return f"{self.prefix}:stats:failure_reasons:{service}:{yyyymmdd}"
+
+    def stats_http_responses(self, yyyymmdd: str) -> str:
+        """HASH: GatewayError.error -> count (rate_limited/queue_full/
+        media_fetch_failed/all_keys_dead/internal_error) — the HTTP-boundary view,
+        distinct from failure_reasons above which is per-key-attempt, not per-response."""
+        return f"{self.prefix}:stats:http_responses:{yyyymmdd}"
+
+    def stats_latency(self, service: str, model: str, yyyymmdd: str) -> str:
+        """HASH: sum_ms, count — for computing average generate latency per model."""
+        return f"{self.prefix}:stats:latency:{service}:{model}:{yyyymmdd}"
+
+    def stats_jobs_items(self, yyyymmdd: str) -> str:
+        """HASH: total, succeeded, failed — every JobStore.finish_item() bumps this."""
+        return f"{self.prefix}:stats:jobs_items:{yyyymmdd}"
+
+    def stats_jobs_failures_by_code(self, yyyymmdd: str) -> str:
+        """HASH: error_code -> count, for finished (failed) job items."""
+        return f"{self.prefix}:stats:jobs_failure_codes:{yyyymmdd}"

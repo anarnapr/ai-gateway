@@ -14,6 +14,7 @@ from app.models.enums import FailureReason, KeyStatus
 from app.pool.backoff import compute_backoff_seconds
 from app.pool.redis_keys import RedisKeys, key_id, key_suffix
 from app.providers.base import FailureClassification
+from app.tracking import stats
 
 LONG_TERM_THRESHOLD_SECONDS = 3600.0
 _LUA_DIR = Path(__file__).parent / "lua"
@@ -360,6 +361,16 @@ class AsyncAPIKeyPool:
     async def _release_inflight(self, token: str) -> None:
         await self.redis.zrem(self.rk.inflight_tokens(), token)
 
+    async def current_in_flight(self) -> int:
+        """Live count of in-flight generate calls across the whole pool (same ZSET
+        acquire_inflight.lua reads/writes) — prunes stale slots first so a crashed
+        request doesn't count against capacity forever. Used by GET /v1/capacity."""
+        now = time.time()
+        await self.redis.zremrangebyscore(
+            self.rk.inflight_tokens(), "-inf", now - self.settings.inflight_slot_ttl_seconds
+        )
+        return await self.redis.zcard(self.rk.inflight_tokens())
+
     async def release_key(self, api_key: str) -> None:
         kid = key_id(api_key)
         async with self._tokens_lock:
@@ -397,10 +408,17 @@ class AsyncAPIKeyPool:
         return 1
 
     async def report_failure(
-        self, api_key: str, model: str, classification: FailureClassification, tracker: Any = None
+        self,
+        api_key: str,
+        model: str,
+        classification: FailureClassification,
+        tracker: Any = None,
+        service: str = "gemini",
     ) -> None:
         kid = key_id(api_key)
         now = time.time()
+
+        await stats.record_failure_reason(self.redis, self.rk, service, classification.reason.value)
 
         if classification.reason == FailureReason.STALE_MEDIA:
             # Cross-key/expired File API ref, not a key health problem — never cool.

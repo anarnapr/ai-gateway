@@ -11,6 +11,7 @@ import redis.asyncio as redis
 from app.config import Settings
 from app.models.jobs import BatchStatus, ItemStatus
 from app.pool.redis_keys import RedisKeys
+from app.tracking import stats
 
 _COUNTER_FIELDS = ("awaiting_media", "queued", "running", "succeeded", "failed")
 
@@ -166,6 +167,8 @@ class JobStore:
         result, bumps counters, and marks the batch completed when the last item
         lands. Returns True if this call completed the batch.
         """
+        await stats.record_job_item_outcome(self.redis, self.rk, success, error_code)
+
         status = ItemStatus.SUCCEEDED if success else ItemStatus.FAILED
         mapping: dict[str, Any] = {"status": status.value, "finished_at": time.time()}
         if result_fields:
