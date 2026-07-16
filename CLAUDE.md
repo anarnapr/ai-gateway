@@ -29,7 +29,10 @@ added later without redesigning the pool/tracker layer.
   `config/models.yaml`, not in Python. No hot-reload in v1 — restart to pick up edits.
 - **Async everywhere in the request path.** Blocking SDK calls (`google.genai`) must be
   wrapped in `asyncio.to_thread` (see `app/providers/gemini/provider.py`) so they don't
-  block the event loop.
+  block the event loop. **Also bound every such call with `asyncio.wait_for`** — a bare
+  `to_thread` with no timeout can hang forever on a stalled network call, and since
+  `to_thread` shares one process-wide default executor thread pool, enough hung calls
+  eventually starve *unrelated* work too (see Known Gotchas: upload_media hang).
 
 ## Hard Constraints (do not relax without discussion)
 - **1-hour cooldown cap**: every cooldown TTL write funnels through
@@ -101,6 +104,28 @@ added later without redesigning the pool/tracker layer.
   reporting a real (often permanent, request-shaped) failure. Covered by
   `tests/test_key_pool.py::test_unknown_failure_does_not_cool_key_or_model` — don't
   regress it without re-reading `test_failed_items_carry_error_not_silent_drop` first.
+
+## Observability (app/api/v1/capacity.py, stats.py, app/tracking/stats.py)
+- **`GET /v1/capacity`** — single-call readiness signal for a caller deciding whether to
+  submit more work: key-pool headroom (`AsyncAPIKeyPool.get_pool_status()`), global
+  in-flight usage (`AsyncAPIKeyPool.current_in_flight()`, reads the same
+  `inflight:tokens` ZSET `acquire_inflight.lua` writes, pruning stale slots first), and
+  jobs-queue headroom (`JobStore.queue_length()` vs `jobs_max_queue_length`). Returns
+  `accepting_more_work: bool` + `reasons: []`. Don't let this drift from the actual
+  enforcement points above — if a new capacity constraint is added elsewhere, add it
+  here too or the signal becomes misleading.
+- **`GET /v1/stats`** — day-scoped counters for offline analysis (calls total/success/
+  failed, failure reason breakdown, HTTP response codes, per-model avg latency, job
+  item outcomes), summed over a trailing N-day window (`days` query param, ≤90 =
+  `stats.STATS_TTL_SECONDS`). Every counter is written from exactly one existing choke
+  point, not scattered across call sites: `CallTracker.record_call()` (calls +
+  latency), `AsyncAPIKeyPool.report_failure()` (failure reasons — unconditional, even
+  for `STALE_MEDIA`/`UNKNOWN` which are no-ops for cooldown purposes), the exception
+  handlers in `app/errors.py` (HTTP-boundary response codes — distinct signal from
+  failure reasons, since one HTTP 429 can follow many per-key failures), and
+  `JobStore.finish_item()` (job item outcomes). Any new failure/response/outcome path
+  must call the matching `app/tracking/stats.py` function from its own choke point,
+  not reimplement counting inline.
 
 ## Database / State
 No SQL database — all shared state lives in Redis (see README "Redis data model" for the

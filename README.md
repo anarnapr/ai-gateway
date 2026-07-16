@@ -230,6 +230,15 @@ TTL can expire mid-item on a 2-minute reel.
 - `GET /v1/keys` — one row per configured key: `status`, `reason`, `retry_in_seconds` —
   this is "which API key is dead, and why."
 - `GET /v1/usage/summary` — today's rpm/rpd/token usage per model, from the quota table.
+- `GET /v1/capacity` — single-call "should I submit more work right now" signal: key-pool
+  headroom, global in-flight usage vs `MAX_IN_FLIGHT`, jobs-queue depth vs
+  `JOBS_MAX_QUEUE_LENGTH`, and a rolled-up `accepting_more_work: bool` + `reasons: []`
+  (`no_keys_available` / `in_flight_at_limit` / `jobs_queue_full`).
+- `GET /v1/stats?days=` (default 1, max 90) — call/failure/latency/job stats for offline
+  analysis: total/success/failed calls, failure-reason breakdown (`rate_limit`,
+  `auth_dead`, ...), HTTP response codes actually returned to callers (429/503/422),
+  per-model average latency, and job item outcomes + failure codes. Day-scoped Redis
+  counters, 90-day retention.
 - `GET /health`, `GET /health/ready` (checks Redis connectivity + at least one key configured).
 
 Or run the dashboard: `python scripts/quota_dashboard.py --url http://localhost:8080 --watch`
@@ -284,6 +293,11 @@ failures propagating fast rather than being absorbed into a cooldown.
 | `jobs:batch_items:{batch_id}` | LIST, EX | Item ids in submit order. |
 | `jobs:item:{batch_id}:{item_id}` | HASH, EX | Item request, status, attempts, result/error fields. |
 | `jobs:all_batches` | ZSET, scored by `created_at` | Every batch_id ever created; feeds `GET /v1/jobs` (list-all). Members for expired batches are lazily `ZREM`'d on read, not TTL'd directly. |
+| `stats:calls:{service}:{yyyymmdd}` | HASH, 90d EX | `total`/`success`/`failed` — bumped by `CallTracker.record_call()`. Feeds `GET /v1/stats`. |
+| `stats:failure_reasons:{service}:{yyyymmdd}` | HASH, 90d EX | `FailureReason.value` → count, bumped unconditionally in `AsyncAPIKeyPool.report_failure()`. |
+| `stats:http_responses:{yyyymmdd}` | HASH, 90d EX | `GatewayError.error` → count (`rate_limited`/`queue_full`/`media_fetch_failed`/`all_keys_dead`/...), bumped in `app/errors.py`'s exception handlers. |
+| `stats:latency:{service}:{model}:{yyyymmdd}` | HASH, 90d EX | `sum_ms`/`count` for average generate latency per model. |
+| `stats:jobs_items:{yyyymmdd}` / `stats:jobs_failure_codes:{yyyymmdd}` | HASH, 90d EX | Job item total/succeeded/failed + failure breakdown by `error_code`, bumped in `JobStore.finish_item()`. |
 
 **Two separate rate-limiting layers**, matching the source repo's original design: the
 pool's own simple per-key RPM cap (`DEFAULT_RPM`), and `CallTracker`'s per-model
@@ -337,6 +351,28 @@ client — no network calls or real API keys required.
 
 ## Recent changes
 
+- **`GET /v1/stats` + `GET /v1/capacity`** (2026-07-16): two new observability
+  endpoints. `/v1/capacity` gives a caller one call to decide whether to submit more
+  work — key-pool headroom, global in-flight usage (new
+  `AsyncAPIKeyPool.current_in_flight()`, reads the `inflight:tokens` ZSET), jobs-queue
+  depth, rolled into `accepting_more_work` + `reasons`. `/v1/stats` answers "how many
+  calls, how many failed, how many 429s, which model is slow" over a trailing N-day
+  window (new `app/tracking/stats.py`, day-scoped Redis hashes, 90-day TTL) — each
+  counter is written from exactly one existing choke point (`CallTracker.record_call`,
+  `AsyncAPIKeyPool.report_failure`, the exception handlers in `app/errors.py`,
+  `JobStore.finish_item`), not duplicated across call sites.
+- **Fixed unbounded `upload_media()` hang** (2026-07-16): a production batch job stalled
+  13/27 items simultaneously — including plain-text items with no media at all — for
+  15+ minutes with zero Gemini calls in the logs. Root cause: `GeminiProvider
+  .upload_media()` wrapped its blocking SDK call in `asyncio.to_thread` but, unlike
+  `generate()`, never bounded it with `asyncio.wait_for` — a stalled upload could hang
+  forever. Since `asyncio.to_thread` shares one process-wide default executor thread
+  pool, enough hung uploads eventually starved *every* other job, including unrelated
+  text-only ones waiting for a free thread for their own `to_thread` call. Fixed by
+  wrapping the whole upload (transfer + existing 600s ACTIVE-state poll) in
+  `asyncio.wait_for(timeout=780s)`, matching `generate()`'s existing pattern — a hung
+  upload now raises `TimeoutError` and rotates to the next key/attempt instead of
+  parking a worker (and eventually the whole pool) forever.
 - **`media_urls` support in batch jobs** (2026-07-15): `JobItemSpec` gained a
   `media_urls: list[str]` field, mutually exclusive with `has_media`. Unlike
   `has_media` items (which sit in `awaiting_media` until a separate multipart upload

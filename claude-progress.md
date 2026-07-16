@@ -1,6 +1,6 @@
 # claude-progress.md - Status
 
-> Last updated: 2026-07-15 (media_urls support: /v1/generate/media/url endpoint + batch jobs JobItemSpec.media_urls)
+> Last updated: 2026-07-16 (GET /v1/capacity + GET /v1/stats observability endpoints; fixed unbounded upload_media() hang)
 > Status: Batch jobs API complete; production rate-limit incident root-caused and fixed (86 tests green)
 
 ## Current State
@@ -124,6 +124,38 @@ dicts only worked within a single process.
   or url download. 86 tests total (5 new: 2 in `tests/test_job_worker.py`, 1 rewritten
   there to match the real per-item dir layout instead of an ad-hoc `tmp_path`; 3 new in
   `tests/test_api_jobs.py`).
+- [x] **`GET /v1/capacity` + `GET /v1/stats`** (2026-07-16): two new observability
+  endpoints, both read-only, no new write paths. `/v1/capacity` answers "should I
+  submit more work right now" in one call: key-pool headroom (`get_pool_status()`),
+  global in-flight usage (new `AsyncAPIKeyPool.current_in_flight()` — reads the same
+  `inflight:tokens` ZSET `acquire_inflight.lua` writes, pruning stale slots first so a
+  crashed request doesn't count against capacity forever), and jobs-queue depth vs
+  `jobs_max_queue_length`, rolled into `accepting_more_work: bool` + `reasons: []`.
+  `/v1/stats?days=` aggregates day-scoped Redis hashes (new `app/tracking/stats.py`,
+  90-day TTL, separate from `CallTracker`'s own short-TTL quota-window keys) into
+  calls total/success/failed, failure-reason breakdown, HTTP response codes actually
+  returned to callers, per-model average latency, and job item outcomes by
+  `error_code`. Each counter is written from exactly one existing choke point
+  (`CallTracker.record_call`, `AsyncAPIKeyPool.report_failure`, the 5 exception
+  handlers in `app/errors.py`, `JobStore.finish_item`) rather than duplicated inline
+  at call sites — verified live against a real `/v1/generate` call (5 internal
+  attempts: 3 `auth_dead`, 1 `rate_limit`, 1 success — stats matched exactly) and a
+  real batch job.
+- [x] **Fixed unbounded `upload_media()` hang** (2026-07-16): found while investigating
+  a live batch job stuck at 13/27 items "running" for 15+ minutes with zero Gemini
+  calls in the logs — including plain-text items with no media at all. Root cause:
+  `GeminiProvider.upload_media()` wrapped its blocking SDK call in `asyncio.to_thread`
+  but never bounded it with `asyncio.wait_for`, unlike `generate()` right below it in
+  the same file. A stalled `client.files.upload()` HTTP call could hang forever;
+  because `asyncio.to_thread` shares one process-wide default executor thread pool,
+  enough hung uploads eventually starved every other task waiting for a free thread —
+  explaining why unrelated text-only items stalled too. Confirmed via Redis: the
+  stuck items' lease TTL was ticking down with zero refreshes (69s → 54s over 15 real
+  seconds), meaning the worker coroutine never reached its retry-sleep point — it was
+  parked inside the very first `await run_generate(...)` call. Fixed by wrapping the
+  whole upload (transfer + existing 600s ACTIVE-state poll) in
+  `asyncio.wait_for(timeout=780s)`. Verified with a monkeypatched hang scenario
+  (raises `TimeoutError` at the configured timeout instead of blocking).
 
 ## Bugs Found & Fixed During Verification
 - [x] **Cooldown classification race**: `classify_key_status` inferred `dead_auth` vs
@@ -195,6 +227,10 @@ earlier test run) success entry and full error detail captured on failures.
 - **No test coverage yet for `GET /v1/jobs`** — the list-all endpoint (see milestone
   above) shipped without a corresponding entry in `tests/test_api_jobs.py`. 69 tests
   total is unchanged from before this endpoint was added.
+- **No test coverage yet for `GET /v1/capacity` or `GET /v1/stats`** — both shipped
+  verified only via live manual smoke-testing against the running container (real
+  `/v1/generate` call, real batch job), not unit tests. 86 tests total is unchanged
+  from before these endpoints were added.
 - **`FailureReason.UNKNOWN` still gets zero cooldown** — Gemini's transient "unable to
   process input image" 400 (68 occurrences in one day's log) retries the same key/model
   back-to-back with no delay. Tried a short backoff, reverted (see the circuit-breaker

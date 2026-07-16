@@ -38,6 +38,8 @@ curl -X POST localhost:8080/v1/generate/media/url \
 curl localhost:8080/v1/pool/status
 curl localhost:8080/v1/keys
 curl localhost:8080/v1/usage/summary
+curl localhost:8080/v1/capacity          # "should I submit more work right now" verdict
+curl localhost:8080/v1/stats?days=7      # calls/failures/429s/latency for analysis
 curl localhost:8080/health/ready
 
 # Batch jobs (async, parallel across the key pool — poll for results):
