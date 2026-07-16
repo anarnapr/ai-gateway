@@ -22,6 +22,11 @@ from app.providers.gemini.errors import classify_gemini_error
 
 _UPLOAD_POLL_TIMEOUT_SECONDS = 600
 _UPLOAD_POLL_INTERVAL_SECONDS = 5
+# Bounds the whole upload_media() call (initial transfer + the ACTIVE-state poll
+# above) — without this, a stalled client.files.upload() HTTP call can hang forever,
+# since (unlike generate()) nothing here previously wrapped it in asyncio.wait_for.
+# +180s buffer over the poll budget covers the raw upload transfer itself.
+_UPLOAD_TOTAL_TIMEOUT_SECONDS = _UPLOAD_POLL_TIMEOUT_SECONDS + 180
 
 
 class GeminiProvider(Provider):
@@ -69,7 +74,15 @@ class GeminiProvider(Provider):
         raise TimeoutError(f"Gemini file upload timed out waiting for ACTIVE state: {media_path}")
 
     async def upload_media(self, media_path: str, api_key: str) -> Optional[UploadedMediaRef]:
-        return await asyncio.to_thread(self._upload_sync, media_path, api_key)
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._upload_sync, media_path, api_key),
+                timeout=_UPLOAD_TOTAL_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"Gemini file upload timed out after {_UPLOAD_TOTAL_TIMEOUT_SECONDS:.0f}s: {media_path}"
+            ) from exc
 
     async def delete_uploaded_media(self, ref: UploadedMediaRef, api_key: str) -> None:
         def _delete():
