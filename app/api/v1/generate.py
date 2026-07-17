@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import shutil
 import time
 import uuid
@@ -11,18 +12,20 @@ from typing import Optional
 from fastapi import APIRouter, Form, HTTPException, Request, UploadFile
 
 from app.config import Settings
-from app.deps import get_call_tracker, get_key_pool, get_provider, get_rate_limiter, get_settings, get_usage_logger
+from app.deps import get_call_tracker, get_key_pool, get_provider, get_rate_limiter, get_redis_client, get_settings, get_usage_logger
 from app.errors import AllKeysDeadHTTPError, MediaFetchHTTPError, PoolExhaustedHTTPError
 from app.media_fetch import MediaDownloadError, download_media
 from app.models.enums import FailureReason
 from app.models.requests import GenerateMediaUrlRequest, GenerateRequest
 from app.models.responses import GenerateResponse
 from app.pool.key_pool import AsyncAPIKeyPool
-from app.pool.redis_keys import key_suffix
+from app.pool.redis_keys import RedisKeys, key_suffix
 from app.providers.base import GenerateContext, Provider, UploadedMediaRef
 from app.rate_limit.limiter import RateLimiter
 from app.tracking.call_tracker import CallTracker
 from app.tracking.usage_logger import UsageLogger
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -48,6 +51,32 @@ async def _raise_pool_error(pool: AsyncAPIKeyPool, request_id: str, provider_nam
     raise PoolExhaustedHTTPError(request_id=request_id, retry_after_seconds=retry_after, key_statuses=key_statuses)
 
 
+async def _cache_and_return(
+    response: GenerateResponse,
+    *,
+    redis_client,
+    settings: Settings,
+) -> GenerateResponse:
+    """Persist a completed GenerateResponse in Redis so clients can re-fetch it.
+
+    This is a best-effort write: a Redis failure is logged and swallowed so it
+    never turns a successful generation into an HTTP 500. The cache entry expires
+    after ``result_cache_ttl_seconds``; set to 0 to disable caching entirely.
+    """
+    ttl = settings.result_cache_ttl_seconds
+    if redis_client is not None and ttl > 0:
+        try:
+            rk = RedisKeys(settings.redis_key_prefix)
+            await redis_client.set(
+                rk.result_cache(response.request_id),
+                response.model_dump_json(),
+                ex=ttl,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("result_cache write failed for %s: %s", response.request_id, exc)
+    return response
+
+
 async def run_generate(
     *,
     request_id: str,
@@ -61,6 +90,7 @@ async def run_generate(
     media_path: Optional[str] = None,
     media_paths: Optional[list[str]] = None,
     deadline_seconds: Optional[float] = None,
+    redis_client=None,
 ) -> GenerateResponse:
     model = provider.resolve_model(req.model)
     max_retries = max(req.max_retries, pool.size() + 5)
@@ -211,17 +241,21 @@ async def run_generate(
                     latency_ms=(time.monotonic() - start_time) * 1000,
                 )
 
-                return GenerateResponse(
-                    request_id=request_id,
-                    provider=provider.name,
-                    model=attempt_model,
-                    text=result.text,
-                    input_tokens=result.input_tokens,
-                    output_tokens=result.output_tokens,
-                    total_tokens=result.total_tokens,
-                    api_key_suffix=key_suffix(key),
-                    attempts=attempt + 1,
-                    latency_ms=(time.monotonic() - start_time) * 1000,
+                return await _cache_and_return(
+                    GenerateResponse(
+                        request_id=request_id,
+                        provider=provider.name,
+                        model=attempt_model,
+                        text=result.text,
+                        input_tokens=result.input_tokens,
+                        output_tokens=result.output_tokens,
+                        total_tokens=result.total_tokens,
+                        api_key_suffix=key_suffix(key),
+                        attempts=attempt + 1,
+                        latency_ms=(time.monotonic() - start_time) * 1000,
+                    ),
+                    redis_client=redis_client,
+                    settings=settings,
                 )
 
             except (AllKeysDeadHTTPError, PoolExhaustedHTTPError):
@@ -287,6 +321,30 @@ async def run_generate(
                 await provider.delete_uploaded_media(ref, uploaded_ref_key)
 
 
+@router.get("/generate/result/{request_id}", response_model=GenerateResponse)
+async def get_generate_result(request_id: str, req: Request) -> GenerateResponse:
+    """Re-fetch a completed generate result by request_id.
+
+    The gateway caches each successful GenerateResponse in Redis for
+    ``result_cache_ttl_seconds`` (default 1 hour). Clients that lost the
+    original HTTP response (network drop, crash, etc.) can call this endpoint
+    to retrieve the same payload without re-running the generation.
+
+    Returns 404 if the result has expired or was never produced.
+    """
+    redis_client = get_redis_client(req)
+    settings: Settings = get_settings(req)
+    rk = RedisKeys(settings.redis_key_prefix)
+    raw = await redis_client.get(rk.result_cache(request_id))
+    if raw is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No cached result for request_id '{request_id}'. "
+                   "It may have expired or the request may not have completed successfully.",
+        )
+    return GenerateResponse.model_validate_json(raw)
+
+
 @router.post("/generate", response_model=GenerateResponse)
 async def generate(request: Request, req: GenerateRequest) -> GenerateResponse:
     provider = get_provider(request, req.provider)
@@ -306,6 +364,7 @@ async def generate(request: Request, req: GenerateRequest) -> GenerateResponse:
         rate_limiter=rate_limiter,
         usage_logger=usage_logger,
         settings=settings,
+        redis_client=get_redis_client(request),
     )
 
 
@@ -343,6 +402,7 @@ async def generate_media(
             usage_logger=usage_logger,
             settings=settings,
             media_path=str(media_path),
+            redis_client=get_redis_client(request),
         )
     finally:
         shutil.rmtree(upload_dir, ignore_errors=True)
@@ -400,6 +460,7 @@ async def generate_media_url(request: Request, req: GenerateMediaUrlRequest) -> 
             usage_logger=usage_logger,
             settings=settings,
             media_paths=[str(p) for p in media_paths],
+            redis_client=get_redis_client(request),
         )
     finally:
         shutil.rmtree(upload_dir, ignore_errors=True)

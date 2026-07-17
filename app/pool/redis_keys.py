@@ -133,3 +133,11 @@ class RedisKeys:
     def stats_jobs_failures_by_code(self, yyyymmdd: str) -> str:
         """HASH: error_code -> count, for finished (failed) job items."""
         return f"{self.prefix}:stats:jobs_failure_codes:{yyyymmdd}"
+
+    # --- Transient result cache (GET /v1/generate/result/{request_id}) ---
+
+    def result_cache(self, request_id: str) -> str:
+        """STRING (JSON) — GenerateResponse for a completed request, kept temporarily
+        so clients can re-fetch if the original response was lost in transit.
+        TTL is controlled by Settings.result_cache_ttl_seconds."""
+        return f"{self.prefix}:result:{request_id}"

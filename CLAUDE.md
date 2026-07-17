@@ -132,6 +132,12 @@ No SQL database — all shared state lives in Redis (see README "Redis data mode
 full key reference). Durable audit logs are plain append-only JSONL files under
 `tmp/ai/logs/calls-YYYY-MM-DD.jsonl` (gitignored, created at runtime).
 
+**Result cache** (`result:{request_id}` STRING, TTL=`RESULT_CACHE_TTL_SECONDS`): every
+successful `run_generate` call writes the full `GenerateResponse` JSON to Redis
+(best-effort — a Redis failure is logged/swallowed, never turns a 200 into a 500). The
+`GET /v1/generate/result/{request_id}` endpoint reads it back. Set
+`RESULT_CACHE_TTL_SECONDS=0` to disable.
+
 ## Not Yet Done
 - The 7 caller files in `socials-instagram` that import `services/support/ai/*` directly
   still need migrating to call this service over HTTP — not part of this repo.

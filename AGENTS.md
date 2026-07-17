@@ -35,6 +35,9 @@ curl -X POST localhost:8080/v1/generate/media/url \
   -H 'Content-Type: application/json' \
   -d '{"prompt":"describe this image","media_urls":["https://cdn.example.com/photo.jpg"]}'
 
+# Re-fetch a past result without re-running generation (valid for RESULT_CACHE_TTL_SECONDS):
+curl localhost:8080/v1/generate/result/{request_id}
+
 curl localhost:8080/v1/pool/status
 curl localhost:8080/v1/keys
 curl localhost:8080/v1/usage/summary
@@ -125,16 +128,6 @@ gemini/
   allowlist in v1 (applies to both this endpoint and `JobItemSpec.media_urls`, same
   `app/media_fetch.py` code path) — trusts the same boundary as the rest of the
   gateway; add one before exposing either to untrusted callers.
-- **`/v1/generate/media/url`** (`app/media_fetch.py`) downloads one or more
-  client-supplied CDN urls (`media_urls: list[str]`, capped by `media_url_max_count`)
-  server-side instead of the caller pushing raw bytes through multipart, then feeds
-  the whole batch through the same `run_generate`/`GenerateContext.media_paths`
-  pipeline `/v1/generate/media` uses. Downloads run concurrently, each bounded by
-  `media_url_max_bytes`/`media_url_download_timeout_seconds` (streamed, enforced even
-  if the server lies about `Content-Length`) — one failed url fails the whole request
-  (`422 media_fetch_failed`), it does not silently drop that file. No private-IP/SSRF
-  allowlist in v1 — this endpoint trusts the same boundary as the rest of the gateway;
-  add one before exposing it to untrusted callers.
 - **`GenerateContext.media_paths` is a list, not a single path** — `Provider.generate()`
   implementations must iterate it (pairing each path with `ctx.extra["uploaded_refs"]`
   when a File-API ref exists for that path, else treating it as inline media) rather
@@ -142,6 +135,11 @@ gemini/
   kwarg for existing single-file callers (`/v1/generate/media`, jobs worker) and
   normalizes it into the same list internally — a new provider only needs to handle
   the list form.
+- **Result cache is best-effort** — `_cache_and_return()` in `app/api/v1/generate.py`
+  catches any Redis write error, logs a warning, and returns the `GenerateResponse`
+  normally. Never let a cache path convert a successful generation into a 500. The
+  rule: if the write is purely for the client's benefit (re-fetch) and not for
+  correctness (pool state, quotas), swallow the error.
 - **New provider checklist**: implement `Provider` ABC (`app/providers/base.py`),
   register in `app/providers/registry.py`'s `_BUILDERS`, add a section to
   `config/models.yaml`, wire its key env var in `app/main.py`. Nothing else changes.

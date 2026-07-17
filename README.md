@@ -89,6 +89,7 @@ docker compose up --build
 | `MEDIA_URL_MAX_BYTES` | `52428800` (50MB) | Max size the gateway will download for each `media_urls` entry, enforced while streaming. |
 | `MEDIA_URL_DOWNLOAD_TIMEOUT_SECONDS` | `30.0` | Timeout for each server-side `media_urls` fetch. |
 | `MEDIA_URL_MAX_COUNT` | `10` | Max number of urls accepted in one `/v1/generate/media/url` request; downloads run concurrently. |
+| `RESULT_CACHE_TTL_SECONDS` | `3600` | How long a successful `GenerateResponse` is kept in Redis under `result:{request_id}` for re-fetch. Set to `0` to disable. |
 
 ## API reference
 
@@ -157,6 +158,26 @@ oversized body on *any* entry fails the whole request with
 the problem is a caller-supplied url, not key/model state. No private-IP/SSRF
 allowlist in v1 (see "Not yet done" below) — only add this endpoint to a deployment
 where callers are already trusted to the same degree as the rest of the gateway.
+
+### `GET /v1/generate/result/{request_id}`
+
+Re-fetch a completed `GenerateResponse` without re-running generation. Every successful
+call to `/v1/generate`, `/v1/generate/media`, or `/v1/generate/media/url` stores the
+full response JSON in Redis for `RESULT_CACHE_TTL_SECONDS` (default 1 hour) keyed by
+the `request_id` returned in the response body.
+
+```bash
+# after a successful generate, save the request_id:
+RESPONSE=$(curl -s -X POST localhost:8080/v1/generate -H 'Content-Type: application/json' -d '{"prompt": "hi"}')
+REQUEST_ID=$(echo $RESPONSE | jq -r .request_id)
+
+# re-fetch the same result later (within RESULT_CACHE_TTL_SECONDS):
+curl -s localhost:8080/v1/generate/result/$REQUEST_ID | jq .
+```
+
+Returns `200` with the identical `GenerateResponse` payload, or `404` if the entry has
+expired or the request never succeeded. The cache write is best-effort — a Redis
+failure is logged and swallowed (the original response is still returned normally).
 
 ### Batch jobs API (async, parallel)
 
@@ -298,6 +319,7 @@ failures propagating fast rather than being absorbed into a cooldown.
 | `stats:http_responses:{yyyymmdd}` | HASH, 90d EX | `GatewayError.error` → count (`rate_limited`/`queue_full`/`media_fetch_failed`/`all_keys_dead`/...), bumped in `app/errors.py`'s exception handlers. |
 | `stats:latency:{service}:{model}:{yyyymmdd}` | HASH, 90d EX | `sum_ms`/`count` for average generate latency per model. |
 | `stats:jobs_items:{yyyymmdd}` / `stats:jobs_failure_codes:{yyyymmdd}` | HASH, 90d EX | Job item total/succeeded/failed + failure breakdown by `error_code`, bumped in `JobStore.finish_item()`. |
+| `result:{request_id}` | STRING, `RESULT_CACHE_TTL_SECONDS` EX | Full `GenerateResponse` JSON for re-fetch after a successful generate. Best-effort write; never blocks or fails the original request. |
 
 **Two separate rate-limiting layers**, matching the source repo's original design: the
 pool's own simple per-key RPM cap (`DEFAULT_RPM`), and `CallTracker`'s per-model
@@ -351,6 +373,14 @@ client — no network calls or real API keys required.
 
 ## Recent changes
 
+- **Result cache / re-fetch endpoint** (2026-07-17): every successful `POST /v1/generate`
+  (all three variants) now stores the full `GenerateResponse` JSON in Redis for
+  `RESULT_CACHE_TTL_SECONDS` (default 1h) under `result:{request_id}`. A new
+  `GET /v1/generate/result/{request_id}` endpoint lets clients re-fetch the result if
+  the original HTTP response was lost in transit (network drop, client crash, etc.)
+  without re-running generation. The cache write is best-effort — a Redis failure is
+  logged and swallowed so it never turns a successful generation into a 500. Set
+  `RESULT_CACHE_TTL_SECONDS=0` to disable. 89 tests total.
 - **`GET /v1/stats` + `GET /v1/capacity`** (2026-07-16): two new observability
   endpoints. `/v1/capacity` gives a caller one call to decide whether to submit more
   work — key-pool headroom, global in-flight usage (new

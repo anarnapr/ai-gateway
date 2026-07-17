@@ -61,3 +61,59 @@ def test_generate_default_timeout_applied_and_rotates_on_hang(api_client, monkey
     assert resp.json()["attempts"] == 2
     # Server default timeout was injected (not None), so the SDK call is bounded.
     assert all(t and t > 0 for t in seen["timeouts"])
+
+
+# ---------------------------------------------------------------------------
+# Result cache (GET /v1/generate/result/{request_id})
+# ---------------------------------------------------------------------------
+
+def test_result_cache_populated_after_successful_generate(api_client, monkeypatch):
+    """After a successful POST /v1/generate the response must be re-fetchable."""
+    async def fake_generate(self, ctx):
+        return ProviderResult(text="cached result", input_tokens=2, output_tokens=4, total_tokens=6)
+
+    monkeypatch.setattr(GeminiProvider, "generate", fake_generate)
+
+    post_resp = api_client.post("/v1/generate", json={"prompt": "store me"})
+    assert post_resp.status_code == 200
+    request_id = post_resp.json()["request_id"]
+
+    # Re-fetch via dedicated endpoint — must return identical payload.
+    get_resp = api_client.get(f"/v1/generate/result/{request_id}")
+    assert get_resp.status_code == 200
+    body = get_resp.json()
+    assert body["request_id"] == request_id
+    assert body["text"] == "cached result"
+    assert body["input_tokens"] == 2
+    assert body["output_tokens"] == 4
+    assert body["total_tokens"] == 6
+
+
+def test_result_cache_404_for_unknown_request_id(api_client):
+    """A request_id that was never produced (or has expired) returns 404."""
+    resp = api_client.get("/v1/generate/result/doesnotexist000")
+    assert resp.status_code == 404
+    assert "doesnotexist000" in resp.json()["detail"]
+
+
+def test_result_cache_disabled_when_ttl_zero(api_client, monkeypatch):
+    """When result_cache_ttl_seconds=0 no cache entry is written."""
+    from app.config import get_settings
+
+    # Patch the setting on the live settings object.
+    settings = get_settings()
+    monkeypatch.setattr(settings, "result_cache_ttl_seconds", 0)
+
+    async def fake_generate(self, ctx):
+        return ProviderResult(text="no cache", input_tokens=1, output_tokens=1, total_tokens=2)
+
+    monkeypatch.setattr(GeminiProvider, "generate", fake_generate)
+
+    post_resp = api_client.post("/v1/generate", json={"prompt": "no cache please"})
+    assert post_resp.status_code == 200
+    request_id = post_resp.json()["request_id"]
+
+    # With TTL=0 the result must NOT have been cached.
+    get_resp = api_client.get(f"/v1/generate/result/{request_id}")
+    assert get_resp.status_code == 404
+

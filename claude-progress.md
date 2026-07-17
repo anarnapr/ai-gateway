@@ -1,7 +1,7 @@
 # claude-progress.md - Status
 
-> Last updated: 2026-07-16 (GET /v1/capacity + GET /v1/stats observability endpoints; fixed unbounded upload_media() hang)
-> Status: Batch jobs API complete; production rate-limit incident root-caused and fixed (86 tests green)
+> Last updated: 2026-07-17 (Result cache + re-fetch endpoint — GET /v1/generate/result/{request_id})
+> Status: Result cache complete; 89 tests green
 
 ## Current State
 `ai-gateway` is a new standalone FastAPI microservice, extracted from
@@ -156,6 +156,24 @@ dicts only worked within a single process.
   whole upload (transfer + existing 600s ACTIVE-state poll) in
   `asyncio.wait_for(timeout=780s)`. Verified with a monkeypatched hang scenario
   (raises `TimeoutError` at the configured timeout instead of blocking).
+- [x] **Result cache + re-fetch endpoint** (2026-07-17): every successful generate call
+  (all three variants: `/v1/generate`, `/v1/generate/media`, `/v1/generate/media/url`)
+  now stores the full `GenerateResponse` JSON in Redis for `RESULT_CACHE_TTL_SECONDS`
+  (default 1h) under key `result:{request_id}`. A new `GET
+  /v1/generate/result/{request_id}` endpoint lets clients re-fetch the exact same
+  payload if the original HTTP response was lost in transit (network drop, client crash,
+  intermittent connectivity) without re-running (expensive) generation. The cache write
+  is best-effort — a Redis failure is caught, logged as a warning, and swallowed, so a
+  Redis blip never converts a successful 200 generate into a 500. Set
+  `RESULT_CACHE_TTL_SECONDS=0` to disable entirely. Implementation: new
+  `_cache_and_return()` async helper in `app/api/v1/generate.py`; new
+  `RedisKeys.result_cache(request_id)` in `app/pool/redis_keys.py`; new
+  `result_cache_ttl_seconds` setting in `app/config.py`; new `get_redis_client()`
+  dep helper; 3 new tests in `tests/test_api_generate.py` (re-fetch succeeds, 404 for
+  unknown ID, TTL=0 disables cache). Job workers call `run_generate` without
+  `redis_client` so the cache is skipped there (job results already live in `JobStore`).
+  Client repos (`socials-instagram`, `socials-x`) gain a `fetch_result(request_id)`
+  helper in their `ai_gateway_client.py`. 89 tests total.
 
 ## Bugs Found & Fixed During Verification
 - [x] **Cooldown classification race**: `classify_key_status` inferred `dead_auth` vs
