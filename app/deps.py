@@ -7,6 +7,7 @@ from app.pool.key_pool import AsyncAPIKeyPool
 from app.providers.base import Provider
 from app.providers.registry import ProviderRegistry
 from app.rate_limit.limiter import RateLimiter
+from app.redis_client import get_redis
 from app.tracking.call_tracker import CallTracker
 from app.tracking.usage_logger import UsageLogger
 
@@ -44,3 +45,8 @@ def get_usage_logger(request: Request) -> UsageLogger:
 
 def get_job_store(request: Request):
     return request.app.state.job_store
+
+
+def get_redis_client(request: Request):
+    """Returns the shared async Redis client stored on app.state."""
+    return get_redis()

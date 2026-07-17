@@ -76,6 +76,13 @@ class Settings(BaseSettings):
     media_url_download_timeout_seconds: float = 30.0
     media_url_max_count: int = 10  # cap on media_urls per request; downloads run concurrently
 
+    # --- Transient result cache (GET /v1/generate/result/{request_id}) ---
+    # Completed GenerateResponse JSON is stored in Redis under result:{request_id}
+    # for this many seconds after a successful /generate (any variant). Lets clients
+    # re-fetch the result if the original response was lost in transit. Set to 0 to
+    # disable caching entirely.
+    result_cache_ttl_seconds: int = 3600  # 1 hour
+
     # --- Batch jobs API (app/jobs/) ---
     # Async queue: POST /v1/jobs enqueues items in Redis, an in-process asyncio worker
     # pool drains them through run_generate, clients poll GET /v1/jobs/{batch_id}.
