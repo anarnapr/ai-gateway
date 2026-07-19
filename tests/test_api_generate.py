@@ -23,6 +23,40 @@ def test_generate_requires_prompt_or_parts(api_client):
     assert resp.status_code == 422
 
 
+def test_generate_with_pinned_model_uses_that_model(api_client, monkeypatch):
+    """Caller pins a model that isn't first in model_priority — the gateway must use
+    exactly that model, not silently fall back to a different one."""
+    seen_models = []
+
+    async def fake_generate(self, ctx):
+        seen_models.append(ctx.model)
+        return ProviderResult(text="pinned", input_tokens=1, output_tokens=1, total_tokens=2)
+
+    monkeypatch.setattr(GeminiProvider, "generate", fake_generate)
+
+    resp = api_client.post("/v1/generate", json={"prompt": "hi", "model": "gemini-2.0-flash"})
+    assert resp.status_code == 200
+    assert resp.json()["model"] == "gemini-2.0-flash"
+    assert seen_models == ["gemini-2.0-flash"]
+
+
+def test_generate_with_pinned_model_alias_resolves(api_client, monkeypatch):
+    async def fake_generate(self, ctx):
+        return ProviderResult(text="alias", input_tokens=1, output_tokens=1, total_tokens=2)
+
+    monkeypatch.setattr(GeminiProvider, "generate", fake_generate)
+
+    resp = api_client.post("/v1/generate", json={"prompt": "hi", "model": "gemini-3.1"})
+    assert resp.status_code == 200
+    assert resp.json()["model"] == "gemini-3.1-flash-preview"
+
+
+def test_generate_with_unknown_model_returns_422(api_client):
+    resp = api_client.post("/v1/generate", json={"prompt": "hi", "model": "gemini-3.1-pro"})
+    assert resp.status_code == 422
+    assert resp.json()["error"] == "unknown_model"
+
+
 def test_generate_retries_on_transient_error_then_succeeds(api_client, monkeypatch):
     calls = {"n": 0}
 

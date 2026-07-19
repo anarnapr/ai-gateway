@@ -104,6 +104,29 @@ added later without redesigning the pool/tracker layer.
   reporting a real (often permanent, request-shaped) failure. Covered by
   `tests/test_key_pool.py::test_unknown_failure_does_not_cool_key_or_model` — don't
   regress it without re-reading `test_failed_items_carry_error_not_silent_drop` first.
+- **A caller-supplied `model` was silently ignored until 2026-07-19.** `run_generate`
+  computed `model = provider.resolve_model(req.model)` but never passed it to
+  `pool.acquire_key()`, whose signature had no `model` param at all —
+  `_get_candidate_models()` always iterated the full `model_priority` list, so
+  `attempt_model = key_model or model` was always overwritten by whatever model the pool
+  happened to find a key for. A client asking for one specific model could silently get
+  a different one back. Fixed: `acquire_key(model=...)` restricts candidate selection to
+  exactly that model (no fallback) when the caller actually sent one; omitting `model`
+  is unchanged (full fallback). Also added `UnknownModelHTTPError` (`422 unknown_model`)
+  for a pinned model not in `model_priority`. Covered by
+  `tests/test_key_pool.py::test_acquire_key_honors_pinned_model` /
+  `test_acquire_key_pinned_model_does_not_fall_back` and
+  `tests/test_api_generate.py::test_generate_with_pinned_model_uses_that_model` /
+  `test_generate_with_unknown_model_returns_422`. Any future change to `acquire_key()`
+  must keep threading the caller's model through — don't let this regress silently.
+- **`redis.from_url()`'s connection pool defaults to 100 max connections** (redis-py
+  default, not unlimited) — this service's fan-out (`acquire_key()` gathers a
+  `leased:*` check per configured key, per candidate model, times
+  `jobs_worker_concurrency` parallel workers, plus sync traffic) can exceed that under
+  load, raising `MaxConnectionsError` on ordinary Redis calls. Now sized via
+  `settings.redis_max_connections` (default 200, `app/redis_client.py`) instead of the
+  library default — raise it further for large key pools / high worker concurrency
+  rather than leaving it unset.
 
 ## Observability (app/api/v1/capacity.py, stats.py, app/tracking/stats.py)
 - **`GET /v1/capacity`** — single-call readiness signal for a caller deciding whether to

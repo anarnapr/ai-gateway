@@ -73,6 +73,7 @@ docker compose up --build
 | `GEMINI_API_KEYS` | *(required)* | Comma-separated Gemini API keys. **This is the only canonical env var name** — the source repo had a confusing `GEMINI_API`/`GEMINI_API_KEY` split; do not reintroduce that here. |
 | `REDIS_URL` | `redis://localhost:6379/0` | Shared pool/quota state. |
 | `REDIS_KEY_PREFIX` | `aiservice` | Namespace prefix for all Redis keys this service writes. |
+| `REDIS_MAX_CONNECTIONS` | `200` | Client-side connection pool cap for the shared Redis client. redis-py defaults this to 100 when unset, which this service's fan-out (`acquire_key()` gathers a `leased:*` check per configured key, per candidate model, times `JOBS_WORKER_CONCURRENCY` parallel workers) can exceed under load, raising `MaxConnectionsError`. Raise further for very large key pools or worker concurrency. |
 | `MAX_IN_FLIGHT` | `4` | Global concurrent-request cap across all keys/workers, Redis-coordinated. |
 | `DEFAULT_RPM` | `15` | Pool's own per-key RPM cap (separate from the per-model quota table in `config/models.yaml`). |
 | `RATE_LIMIT_MIN_INTERVAL_SECONDS` | `5.0` | Minimum spacing between requests on the same key. |
@@ -103,6 +104,15 @@ curl -s -X POST localhost:8080/v1/generate \
 
 Body: `{provider?, prompt?, parts?, model?, max_retries?, timeout_seconds?, verbose?, metadata?}`
 (one of `prompt`/`parts` required — `422` otherwise).
+
+`model` behavior: omit it and the gateway falls back down the full `model_priority` list
+in `config/models.yaml` as usual (aliases resolved, e.g. `gemini-3.1` →
+`gemini-3.1-flash-preview`). **Send it, and the gateway pins the request to exactly that
+model — no cross-model fallback.** If every key is cooled down for that one model, the
+request fails (`429`/`503`) rather than silently substituting a different model. An
+unrecognized model name (not in `model_priority`, e.g. a typo or a model id that doesn't
+exist for this provider) returns `422 {"error": "unknown_model", ...}` immediately,
+before any pool/key work. Same behavior applies to batch job items' `model` field.
 
 Response `200`:
 ```json
@@ -240,7 +250,8 @@ TTL can expire mid-item on a 2-minute reel.
   answers "how much time until this key is useful again."
 - **`503`** — every configured key is `dead_auth`/`dead_quota`, or no keys are
   configured at all. Body includes `key_statuses` (which key, which status, why).
-- **`422`** — validation error.
+- **`422`** — validation error (bad body shape, or `error: "unknown_model"` when a
+  pinned `model` isn't in `model_priority`).
 - **`500`** — unexpected error, logged to `tmp/ai/logs/errors-*.log`.
 
 ### Pool / key / usage inspection
@@ -373,6 +384,21 @@ client — no network calls or real API keys required.
 
 ## Recent changes
 
+- **`model` now actually pins the request** (2026-07-19): previously, a client-supplied
+  `model` was resolved (alias lookup) but never passed into `AsyncAPIKeyPool.acquire_key()`
+  — the pool always iterated the full `model_priority` list internally and returned
+  whatever model it found a key for, silently overriding the caller's choice. Fixed by
+  adding a `model` param to `acquire_key()`/`_get_candidate_models()`: when the caller
+  pins a model, candidate selection is restricted to that one model with no cross-model
+  fallback (all keys cooled on that model → request fails instead of substituting a
+  different one); omitting `model` is unchanged (full priority-list fallback). Also added
+  `UnknownModelHTTPError` (`422 unknown_model`) so a typo'd/nonexistent model fails fast
+  instead of reaching the SDK. Same fix applies to batch job items (`JobItemSpec.model`),
+  since jobs reuse `run_generate`. Also bumped `redis.from_url()`'s default client-side
+  `max_connections` (redis-py defaults to 100) to a configurable `REDIS_MAX_CONNECTIONS`
+  (default 200) — this service's per-`acquire_key()` fan-out (a `leased:*` gather across
+  every key, per candidate model, times `JOBS_WORKER_CONCURRENCY` parallel workers) was
+  exceeding 100 in-flight connections under load and raising `MaxConnectionsError`.
 - **Result cache / re-fetch endpoint** (2026-07-17): every successful `POST /v1/generate`
   (all three variants) now stores the full `GenerateResponse` JSON in Redis for
   `RESULT_CACHE_TTL_SECONDS` (default 1h) under `result:{request_id}`. A new
