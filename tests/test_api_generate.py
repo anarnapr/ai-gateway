@@ -34,10 +34,10 @@ def test_generate_with_pinned_model_uses_that_model(api_client, monkeypatch):
 
     monkeypatch.setattr(GeminiProvider, "generate", fake_generate)
 
-    resp = api_client.post("/v1/generate", json={"prompt": "hi", "model": "gemini-2.0-flash"})
+    resp = api_client.post("/v1/generate", json={"prompt": "hi", "model": "gemini-2.5-flash-lite"})
     assert resp.status_code == 200
-    assert resp.json()["model"] == "gemini-2.0-flash"
-    assert seen_models == ["gemini-2.0-flash"]
+    assert resp.json()["model"] == "gemini-2.5-flash-lite"
+    assert seen_models == ["gemini-2.5-flash-lite"]
 
 
 def test_generate_with_pinned_model_alias_resolves(api_client, monkeypatch):
@@ -51,8 +51,19 @@ def test_generate_with_pinned_model_alias_resolves(api_client, monkeypatch):
     assert resp.json()["model"] == "gemini-3.1-flash-preview"
 
 
-def test_generate_with_unknown_model_returns_422(api_client):
+def test_generate_with_pinned_model_pro_alias_resolves(api_client, monkeypatch):
+    async def fake_generate(self, ctx):
+        return ProviderResult(text="pro", input_tokens=1, output_tokens=1, total_tokens=2)
+
+    monkeypatch.setattr(GeminiProvider, "generate", fake_generate)
+
     resp = api_client.post("/v1/generate", json={"prompt": "hi", "model": "gemini-3.1-pro"})
+    assert resp.status_code == 200
+    assert resp.json()["model"] == "gemini-3.1-pro-preview"
+
+
+def test_generate_with_unknown_model_returns_422(api_client):
+    resp = api_client.post("/v1/generate", json={"prompt": "hi", "model": "gemini-4-ultra-preview"})
     assert resp.status_code == 422
     assert resp.json()["error"] == "unknown_model"
 

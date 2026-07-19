@@ -384,6 +384,17 @@ client — no network calls or real API keys required.
 
 ## Recent changes
 
+- **Model roster update** (2026-07-19): `config/models.yaml` `model_priority` gained
+  `gemini-3.1-pro-preview` (inserted after `gemini-2.5-flash`) and dropped
+  `gemini-2.0-flash`, `gemini-2.0-flash-lite`, `gemini-1.5-flash`, `gemini-1.5-pro`.
+  Fixed `gemini-flash-latest` alias, which pointed at the now-removed
+  `gemini-2.0-flash` — repointed to `gemini-2.5-flash`. Added `gemini-3.1-pro` shorthand
+  alias → `gemini-3.1-pro-preview`, matching the existing `gemini-3.1`/`gemini-3.1-flash`
+  alias pattern. New `quota_table` row for `gemini-3.1-pro-preview` is a **placeholder**
+  (`rpm: 2, tpm: 32000, rpd: 50`, mirroring the removed `gemini-1.5-pro`'s tighter
+  pro-tier shape) — not verified against Google's real quota page for this model, correct
+  before relying on it for rate-limit enforcement. No hot-reload — restart the service to
+  pick this up.
 - **`model` now actually pins the request** (2026-07-19): previously, a client-supplied
   `model` was resolved (alias lookup) but never passed into `AsyncAPIKeyPool.acquire_key()`
   — the pool always iterated the full `model_priority` list internally and returned

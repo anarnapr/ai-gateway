@@ -9,10 +9,7 @@ gemini:
     - gemini-3-flash-preview
     - gemini-2.5-flash-lite
     - gemini-2.5-flash
-    - gemini-2.0-flash
-    - gemini-2.0-flash-lite
-    - gemini-1.5-flash
-    - gemini-1.5-pro
+    - gemini-3.1-pro-preview
 
   # Resolves a caller-supplied shorthand/alias to the concrete model id used for both the
   # SDK call and quota lookups.
@@ -22,7 +19,8 @@ gemini:
     gemini-3.1-flash-lite: gemini-3.1-flash-lite-preview
     gemini-3.1-flash: gemini-3.1-flash-preview
     gemini-3-flash: gemini-3-flash-preview
-    gemini-flash-latest: gemini-2.0-flash
+    gemini-3.1-pro: gemini-3.1-pro-preview
+    gemini-flash-latest: gemini-2.5-flash
 
   quota_table:
     gemini-3.1-flash-lite-preview: {rpm: 15, tpm: 1000000, rpd: 500}
@@ -30,10 +28,10 @@ gemini:
     gemini-3-flash-preview: {rpm: 15, tpm: 1000000, rpd: 500}
     gemini-2.5-flash-lite: {rpm: 15, tpm: 1000000, rpd: 500}
     gemini-2.5-flash: {rpm: 15, tpm: 1000000, rpd: 500}
-    gemini-2.0-flash: {rpm: 15, tpm: 1000000, rpd: 2000}
-    gemini-2.0-flash-lite: {rpm: 30, tpm: 1000000, rpd: 2000}
-    gemini-1.5-flash: {rpm: 15, tpm: 1000000, rpd: 1500}
-    gemini-1.5-pro: {rpm: 2, tpm: 32000, rpd: 50}
+    # PLACEHOLDER quota — mirrors gemini-1.5-pro's tighter pro-tier shape (pro models
+    # are typically far more rate-limited than flash on the free tier). Verify against
+    # the real Gemini API quota page for this model and correct before relying on it.
+    gemini-3.1-pro-preview: {rpm: 2, tpm: 32000, rpd: 50}
 
   backoff:
     rate_limit_base_seconds: 30.0

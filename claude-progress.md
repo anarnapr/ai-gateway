@@ -1,7 +1,7 @@
 # claude-progress.md - Status
 
-> Last updated: 2026-07-19 (Model pinning fix + Redis connection pool sizing)
-> Status: Model pinning complete; 94 tests total, 91 green (3 pre-existing local failures unrelated — `tmp/ai/uploads` permission on this machine, not a code regression)
+> Last updated: 2026-07-19 (Model pinning fix + Redis connection pool sizing + model roster update)
+> Status: Model pinning complete; 95 tests total, 92 green (3 pre-existing local failures unrelated — `tmp/ai/uploads` permission on this machine, not a code regression)
 
 ## Current State
 `ai-gateway` is a new standalone FastAPI microservice, extracted from
@@ -204,6 +204,21 @@ dicts only worked within a single process.
   `tests/test_api_generate.py::test_generate_with_pinned_model_uses_that_model` /
   `test_generate_with_pinned_model_alias_resolves` /
   `test_generate_with_unknown_model_returns_422`. 94 tests total.
+- [x] **Model roster update** (2026-07-19): `config/models.yaml` `model_priority` gained
+  `gemini-3.1-pro-preview` (after `gemini-2.5-flash`), dropped `gemini-2.0-flash`,
+  `gemini-2.0-flash-lite`, `gemini-1.5-flash`, `gemini-1.5-pro` (+ their `quota_table`
+  rows). Caught and fixed a break this would've otherwise caused silently:
+  `gemini-flash-latest` aliased to `gemini-2.0-flash`, which was just removed —
+  repointed to `gemini-2.5-flash`. Added `gemini-3.1-pro` → `gemini-3.1-pro-preview`
+  alias (same shorthand pattern as the other 3.1 entries), directly useful given the
+  earlier `model` pinning fix. New `gemini-3.1-pro-preview` quota row is a
+  **placeholder** (mirrors old `gemini-1.5-pro`'s tighter pro-tier shape) — not
+  verified against real Gemini API quota limits for this model. Updated
+  `tests/test_api_generate.py` tests that referenced now-removed/now-legitimate model
+  names (pinned-model test switched from `gemini-2.0-flash` to `gemini-2.5-flash-lite`;
+  unknown-model test switched from `gemini-3.1-pro`, now valid, to
+  `gemini-4-ultra-preview`); added `test_generate_with_pinned_model_pro_alias_resolves`.
+  95 tests total.
 
 ## Bugs Found & Fixed During Verification
 - [x] **Cooldown classification race**: `classify_key_status` inferred `dead_auth` vs
