@@ -1,7 +1,7 @@
 # claude-progress.md - Status
 
-> Last updated: 2026-07-17 (Result cache + re-fetch endpoint — GET /v1/generate/result/{request_id})
-> Status: Result cache complete; 89 tests green
+> Last updated: 2026-07-19 (Model pinning fix + Redis connection pool sizing)
+> Status: Model pinning complete; 94 tests total, 91 green (3 pre-existing local failures unrelated — `tmp/ai/uploads` permission on this machine, not a code regression)
 
 ## Current State
 `ai-gateway` is a new standalone FastAPI microservice, extracted from
@@ -174,6 +174,36 @@ dicts only worked within a single process.
   `redis_client` so the cache is skipped there (job results already live in `JobStore`).
   Client repos (`socials-instagram`, `socials-x`) gain a `fetch_result(request_id)`
   helper in their `ai_gateway_client.py`. 89 tests total.
+- [x] **`model` pinning actually enforced + Redis pool sizing** (2026-07-19): a user
+  question ("if a client asks for one specific model, is that honored?") surfaced a real
+  bug — it wasn't. `run_generate` resolved `req.model` but never passed it into
+  `pool.acquire_key()`, which had no `model` parameter at all;
+  `_get_candidate_models()` always iterated the full `model_priority` list, so
+  `attempt_model = key_model or model` was always overwritten by whichever model the
+  pool found a key for. A client asking for exactly `gemini-3.1-flash-preview` could
+  silently get e.g. `gemini-3.1-flash-lite-preview` back instead, with no error. Fixed:
+  `acquire_key(model=...)` restricts `_get_candidate_models()` to exactly that one model
+  (no cross-model fallback) whenever the caller actually sent a `model`; omitting it
+  keeps the existing full-fallback behavior unchanged. Also added
+  `UnknownModelHTTPError` (`app/errors.py`, `422 {"error": "unknown_model"}`) so a
+  pinned model not present in `provider.model_priority()` (typo, retired preview id,
+  made-up name like the `gemini-3.1-pro` example that prompted this) fails fast before
+  any pool/key work instead of reaching the SDK and failing there on every attempt.
+  Same fix covers batch job items (`JobItemSpec.model`) for free, since jobs reuse
+  `run_generate`. Separately, found the shared Redis client
+  (`app/redis_client.py::get_redis()`) was never given an explicit
+  `max_connections`, so redis-py's async `ConnectionPool` silently defaulted to 100 —
+  this service's `acquire_key()` fan-out (a `leased:*` existence check gathered across
+  every configured key, per candidate model, times `jobs_worker_concurrency` parallel
+  workers, plus sync HTTP traffic) can exceed that under load, surfacing as
+  `MaxConnectionsError` on ordinary Redis calls (observed live: `JobStore.set_item_fields`
+  failing mid-job). Added `REDIS_MAX_CONNECTIONS` setting (default 200), threaded into
+  `redis.from_url(..., max_connections=settings.redis_max_connections)`. 5 new tests:
+  `tests/test_key_pool.py::test_acquire_key_honors_pinned_model` /
+  `test_acquire_key_pinned_model_does_not_fall_back`;
+  `tests/test_api_generate.py::test_generate_with_pinned_model_uses_that_model` /
+  `test_generate_with_pinned_model_alias_resolves` /
+  `test_generate_with_unknown_model_returns_422`. 94 tests total.
 
 ## Bugs Found & Fixed During Verification
 - [x] **Cooldown classification race**: `classify_key_status` inferred `dead_auth` vs

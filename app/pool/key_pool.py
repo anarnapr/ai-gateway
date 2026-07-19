@@ -150,9 +150,13 @@ class AsyncAPIKeyPool:
 
     # ---------- model candidate selection ----------
 
-    async def _get_candidate_models(self, now: float) -> list[str]:
+    async def _get_candidate_models(self, now: float, pinned_model: Optional[str] = None) -> list[str]:
+        # A caller-pinned model restricts candidates to that one model only — no
+        # cross-model fallback. Absent a pin, fall back down the full priority list
+        # as before.
+        models = [pinned_model] if pinned_model else self.model_priority
         candidates = []
-        for model in self.model_priority:
+        for model in models:
             remaining = await self._read_cooldown(self.rk.cooldown_model(model), now)
             if remaining <= 0:
                 candidates.append(model)
@@ -232,6 +236,7 @@ class AsyncAPIKeyPool:
         service: str = "gemini",
         method: str = "generate",
         max_wait_seconds: float = 120.0,
+        model: Optional[str] = None,
     ) -> tuple[Optional[str], Optional[str]]:
         await self._load_scripts()
         if not self.api_keys:
@@ -241,7 +246,7 @@ class AsyncAPIKeyPool:
 
         while time.time() < deadline:
             now = time.time()
-            candidate_models = await self._get_candidate_models(now)
+            candidate_models = await self._get_candidate_models(now, pinned_model=model)
             if not candidate_models:
                 return None, None
 

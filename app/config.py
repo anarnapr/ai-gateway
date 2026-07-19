@@ -12,6 +12,13 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://localhost:6379/0"
     redis_key_prefix: str = "aiservice"
+    # redis-py's async ConnectionPool defaults max_connections to 100 when unset. This
+    # app fans out heavily per acquire_key() attempt (one gather() checking `leased:*`
+    # across every configured key, repeated per candidate model in model_priority) times
+    # jobs_worker_concurrency parallel workers plus sync HTTP traffic — comfortably
+    # exceeds 100 in-flight connections under load, raising `MaxConnectionsError`.
+    # Size above worst-case concurrent demand instead of relying on the library default.
+    redis_max_connections: int = 200
 
     # Key leases are per-key-exclusive (SET NX leased:{kid}), so the useful ceiling is
     # the key count — with 27 keys, 27 means "the whole pool may be busy at once".

@@ -13,7 +13,12 @@ from fastapi import APIRouter, Form, HTTPException, Request, UploadFile
 
 from app.config import Settings
 from app.deps import get_call_tracker, get_key_pool, get_provider, get_rate_limiter, get_redis_client, get_settings, get_usage_logger
-from app.errors import AllKeysDeadHTTPError, MediaFetchHTTPError, PoolExhaustedHTTPError
+from app.errors import (
+    AllKeysDeadHTTPError,
+    MediaFetchHTTPError,
+    PoolExhaustedHTTPError,
+    UnknownModelHTTPError,
+)
 from app.media_fetch import MediaDownloadError, download_media
 from app.models.enums import FailureReason
 from app.models.requests import GenerateMediaUrlRequest, GenerateRequest
@@ -93,6 +98,11 @@ async def run_generate(
     redis_client=None,
 ) -> GenerateResponse:
     model = provider.resolve_model(req.model)
+    # A caller-supplied model pins the pool to that model only — no cross-model
+    # fallback. Omitting `model` keeps the existing full model_priority fallback.
+    pinned_model = model if req.model else None
+    if pinned_model and pinned_model not in provider.model_priority():
+        raise UnknownModelHTTPError(request_id, pinned_model, provider.model_priority())
     max_retries = max(req.max_retries, pool.size() + 5)
     prompt_parts = req.parts_as_dicts()
 
@@ -134,6 +144,7 @@ async def run_generate(
                     service=provider.name,
                     method="generate",
                     max_wait_seconds=acquire_wait,
+                    model=pinned_model,
                 )
                 if not key:
                     await _raise_pool_error(pool, request_id, provider.name)

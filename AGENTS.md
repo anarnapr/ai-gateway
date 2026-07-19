@@ -143,6 +143,17 @@ gemini/
 - **New provider checklist**: implement `Provider` ABC (`app/providers/base.py`),
   register in `app/providers/registry.py`'s `_BUILDERS`, add a section to
   `config/models.yaml`, wire its key env var in `app/main.py`. Nothing else changes.
+- **A caller-pinned `model` must mean exactly that model, no substitution.**
+  `run_generate` (`app/api/v1/generate.py`) resolves `req.model` (alias lookup) and,
+  only when the caller actually sent one, passes it into `pool.acquire_key(model=...)`.
+  `AsyncAPIKeyPool._get_candidate_models()` (`app/pool/key_pool.py`) restricts candidate
+  models to exactly that one when a pin is given — never falls back to
+  `model_priority`. Omitting `model` keeps the full-fallback behavior. An unrecognized
+  pinned model (not in `provider.model_priority()`) must fail fast with
+  `UnknownModelHTTPError` (`422 unknown_model`) before any pool/key work, not reach the
+  SDK. Don't reintroduce a path where `acquire_key()` is called without threading the
+  caller's pin through — that silently substitutes whatever model the pool finds a key
+  for, which is the bug this fixed.
 - **Update the README** ("Recent changes" section) whenever a feature is added — this
   convention carries over from the source repo's CLAUDE.md.
 

@@ -42,6 +42,35 @@ async def test_acquire_and_release_key(key_pool: AsyncAPIKeyPool):
 
 
 @pytest.mark.asyncio
+async def test_acquire_key_honors_pinned_model(key_pool: AsyncAPIKeyPool):
+    pinned = GEMINI_MODEL_PRIORITY[-1]  # not the first-priority model
+    key, model = await key_pool.acquire_key(model=pinned)
+    assert key in key_pool.api_keys
+    assert model == pinned
+
+
+@pytest.mark.asyncio
+async def test_acquire_key_pinned_model_does_not_fall_back(key_pool: AsyncAPIKeyPool):
+    pinned = GEMINI_MODEL_PRIORITY[0]
+    other_model = GEMINI_MODEL_PRIORITY[1]
+
+    # Blacklist only the pinned model, leave the rest of the priority list healthy.
+    for api_key in key_pool.api_keys:
+        classification = FailureClassification(reason=FailureReason.QUOTA_EXHAUSTED, scope="key_model")
+        await key_pool.report_failure(api_key, pinned, classification)
+
+    # No pin: pool falls back to the next model in priority order as usual.
+    key, model = await key_pool.acquire_key()
+    assert model == other_model
+
+    # Pinned: no candidate models at all (the one model asked for is cooled down),
+    # so acquire_key gives up rather than silently substituting a different model.
+    key2, model2 = await key_pool.acquire_key(model=pinned, max_wait_seconds=0.01)
+    assert key2 is None
+    assert model2 is None
+
+
+@pytest.mark.asyncio
 async def test_acquire_key_skips_leased_keys(key_pool: AsyncAPIKeyPool):
     key1, model1 = await key_pool.acquire_key()
     key2, model2 = await key_pool.acquire_key()
