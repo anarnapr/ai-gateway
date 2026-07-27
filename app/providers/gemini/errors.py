@@ -43,7 +43,13 @@ def classify_gemini_error(error: str) -> FailureClassification:
         return FailureClassification(reason=FailureReason.QUOTA_EXHAUSTED, scope="key_model", retryable=True)
 
     if _NOT_FOUND_RE.search(message):
-        return FailureClassification(reason=FailureReason.NOT_FOUND, scope="model", retryable=True)
+        # A 404 here ("model not found" / "no longer available to new users") is a
+        # property of the calling key's own Google Cloud project, not the model
+        # itself — sibling projects created at other times routinely differ on
+        # which models they can see. Scope key_model (not model): report_failure()
+        # only escalates to a pool-wide model blacklist once every key has
+        # independently confirmed the same 404, same as QUOTA_EXHAUSTED.
+        return FailureClassification(reason=FailureReason.NOT_FOUND, scope="key_model", retryable=True)
 
     if _RATE_LIMIT_RE.search(message):
         return FailureClassification(reason=FailureReason.RATE_LIMIT, scope="key_model", retryable=True)

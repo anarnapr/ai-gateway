@@ -161,6 +161,19 @@ class GeminiProvider(Provider):
             input_tokens = getattr(usage, "prompt_token_count", None)
             output_tokens = getattr(usage, "candidates_token_count", None)
 
+        if response.text is None:
+            # The SDK returns None (not an exception) when there's no usable text —
+            # typically a safety block, RECITATION, or MAX_TOKENS with an empty first
+            # candidate. Surface *why* instead of crashing with a bare AttributeError:
+            # a blind .strip() here previously did, and since that message matches no
+            # classify_gemini_error() pattern it fell through as FailureReason.UNKNOWN
+            # (no cooldown, no "stop retrying" signal) — the retry loop then hammered
+            # every other key with the same rejected content, since the cause is the
+            # prompt/media, not the key.
+            candidates = getattr(response, "candidates", None) or []
+            finish_reason = getattr(candidates[0], "finish_reason", None) if candidates else None
+            raise RuntimeError(f"Gemini returned no text (finish_reason={finish_reason}).")
+
         result_text = response.text.strip().replace("\n", " ")
         return ProviderResult(
             text=result_text,

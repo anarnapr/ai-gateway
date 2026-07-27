@@ -122,13 +122,38 @@ async def test_record_success_clears_failure_state(key_pool: AsyncAPIKeyPool):
 
 
 @pytest.mark.asyncio
-async def test_not_found_blacklists_model_for_all_keys(key_pool: AsyncAPIKeyPool):
+async def test_not_found_does_not_blacklist_model_for_single_key(key_pool: AsyncAPIKeyPool):
+    # A 404 is a property of the reporting key's own project (e.g. model retired for
+    # new Google Cloud projects only), not the model itself — sibling keys on other
+    # projects routinely still have access. One key's 404 must not take the model
+    # away from the whole pool; it should only cool that one key on that model.
     model = GEMINI_MODEL_PRIORITY[0]
-    classification = FailureClassification(reason=FailureReason.NOT_FOUND, scope="model")
-    await key_pool.report_failure(key_pool.api_keys[0], model, classification)
+    api_key = key_pool.api_keys[0]
+    classification = FailureClassification(reason=FailureReason.NOT_FOUND, scope="key_model")
+    await key_pool.report_failure(api_key, model, classification)
 
     candidates = await key_pool._get_candidate_models(time.time())
-    assert model not in candidates
+    assert model in candidates
+
+    status, retry_in = await key_pool.classify_key_status(api_key, model, time.time())
+    assert status == KeyStatus.DEAD_QUOTA.value
+    assert retry_in <= 3600.0
+
+
+@pytest.mark.asyncio
+async def test_not_found_blacklists_model_once_all_keys_confirm_it(fake_redis, settings):
+    keys = "key-aaaa1111,key-bbbb2222"
+    pool = AsyncAPIKeyPool(fake_redis, keys, GEMINI_MODEL_PRIORITY, settings)
+    model = GEMINI_MODEL_PRIORITY[0]
+    classification = FailureClassification(reason=FailureReason.NOT_FOUND, scope="key_model")
+
+    await pool.report_failure("key-aaaa1111", model, classification)
+    candidates = await pool._get_candidate_models(time.time())
+    assert model in candidates  # only one of two keys confirmed so far
+
+    await pool.report_failure("key-bbbb2222", model, classification)
+    candidates_after = await pool._get_candidate_models(time.time())
+    assert model not in candidates_after  # both keys confirmed -> model blacklisted
 
 
 @pytest.mark.asyncio

@@ -130,6 +130,7 @@ class AsyncAPIKeyPool:
             if keymodel_remaining >= LONG_TERM_THRESHOLD_SECONDS or reason in (
                 FailureReason.AUTH_DEAD.value,
                 FailureReason.QUOTA_EXHAUSTED.value,
+                FailureReason.NOT_FOUND.value,
             ):
                 if reason == FailureReason.AUTH_DEAD.value:
                     return KeyStatus.DEAD_AUTH.value, keymodel_remaining
@@ -451,8 +452,24 @@ class AsyncAPIKeyPool:
             return
 
         if classification.reason == FailureReason.NOT_FOUND:
+            # Per-key first, not pool-wide: a 404 reflects this key's own project not
+            # having the model, not the model being globally broken (see errors.py).
+            # Only escalate to a pool-wide blacklist once every key has independently
+            # hit it too — same escalation pattern as QUOTA_EXHAUSTED below.
             ttl = self._clamped(self.settings.dead_cooldown_seconds)
-            await self.redis.set(self.rk.cooldown_model(model), now + ttl, ex=max(1, math.ceil(ttl)))
+            await self.redis.set(self.rk.cooldown_keymodel(kid, model), now + ttl, ex=max(1, math.ceil(ttl)))
+            streak = await self._get_failure_streak(kid, model, FailureReason.NOT_FOUND.value)
+            await self._set_failure_meta(kid, model, FailureReason.NOT_FOUND.value, ttl, streak)
+
+            all_not_found = True
+            for key in self.api_keys:
+                remaining = await self._read_cooldown(self.rk.cooldown_keymodel(key_id(key), model), now)
+                if remaining <= 0:
+                    all_not_found = False
+                    break
+            if all_not_found:
+                model_ttl = self._clamped(self.settings.dead_cooldown_seconds)
+                await self.redis.set(self.rk.cooldown_model(model), now + model_ttl, ex=max(1, math.ceil(model_ttl)))
             return
 
         if classification.reason in (FailureReason.RATE_LIMIT, FailureReason.HIGH_DEMAND):

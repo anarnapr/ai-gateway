@@ -34,10 +34,10 @@ def test_generate_with_pinned_model_uses_that_model(api_client, monkeypatch):
 
     monkeypatch.setattr(GeminiProvider, "generate", fake_generate)
 
-    resp = api_client.post("/v1/generate", json={"prompt": "hi", "model": "gemini-2.5-flash-lite"})
+    resp = api_client.post("/v1/generate", json={"prompt": "hi", "model": "gemini-3.5-flash"})
     assert resp.status_code == 200
-    assert resp.json()["model"] == "gemini-2.5-flash-lite"
-    assert seen_models == ["gemini-2.5-flash-lite"]
+    assert resp.json()["model"] == "gemini-3.5-flash"
+    assert seen_models == ["gemini-3.5-flash"]
 
 
 def test_generate_with_pinned_model_alias_resolves(api_client, monkeypatch):
@@ -48,7 +48,7 @@ def test_generate_with_pinned_model_alias_resolves(api_client, monkeypatch):
 
     resp = api_client.post("/v1/generate", json={"prompt": "hi", "model": "gemini-3.1"})
     assert resp.status_code == 200
-    assert resp.json()["model"] == "gemini-3.1-flash-preview"
+    assert resp.json()["model"] == "gemini-3.1-flash-lite"
 
 
 def test_generate_with_pinned_model_pro_alias_resolves(api_client, monkeypatch):

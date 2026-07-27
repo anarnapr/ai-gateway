@@ -1,36 +1,54 @@
 # Per-provider model configuration: priority/fallback order, per-model quota table
 # (rpm/tpm/rpd, -1 = unlimited), and model name aliases. Loaded once at startup by
 # ProviderRegistry. Edit and restart the service to apply changes (no hot-reload in v1).
+#
+# quota_table numbers below are taken from the Google AI Studio console per-model
+# usage page (2026-07-23), NOT guessed/uniform — a prior version of this table had
+# rpd:500/rpm:15/tpm:1M copy-pasted across every model, which let the gateway
+# over-dispatch past several models' real (much lower) daily caps and only find out
+# via a real 429 from Google. gemini-2.5-flash was removed (moved to paid tier,
+# unusable on these free-tier keys). gemini-3.1-flash-preview was removed: confirmed
+# 0/33 real calls succeeding, Google returning "404 models/gemini-3.1-flash-preview is
+# not found for API version v1beta" — it doesn't exist for this key pool, and it's
+# absent from the console's model list entirely. gemini-2.5-flash-lite removed
+# 2026-07-23 (outdated generation, superseded by the 3.x flash-lite models).
+# gemini-3.1-flash-lite-preview renamed to gemini-3.1-flash-lite same day (2026-07-23:
+# every configured model, including this one under its new name, verified live via
+# the running key pool's real keys — a real generateContent call succeeded).
 
 gemini:
   model_priority:
-    - gemini-3.1-flash-lite-preview
-    - gemini-3.1-flash-preview
+    - gemini-3.5-flash-lite
+    - gemini-3.1-flash-lite
     - gemini-3-flash-preview
-    - gemini-2.5-flash-lite
-    - gemini-2.5-flash
+    - gemini-3.5-flash
+    - gemini-3.6-flash
     - gemini-3.1-pro-preview
 
   # Resolves a caller-supplied shorthand/alias to the concrete model id used for both the
   # SDK call and quota lookups.
   model_aliases:
-    gemini-3.1: gemini-3.1-flash-preview
+    gemini-3.1: gemini-3.1-flash-lite
     gemini-3: gemini-3-flash-preview
-    gemini-3.1-flash-lite: gemini-3.1-flash-lite-preview
-    gemini-3.1-flash: gemini-3.1-flash-preview
+    gemini-3.1-flash: gemini-3.1-flash-lite
     gemini-3-flash: gemini-3-flash-preview
     gemini-3.1-pro: gemini-3.1-pro-preview
-    gemini-flash-latest: gemini-2.5-flash
+    gemini-3.5: gemini-3.5-flash
+    gemini-3.6: gemini-3.6-flash
+    # Was gemini-2.5-flash (now paid/removed). Mirrors Google's own
+    # "Flash-Lite Latest" alias, which currently points to gemini-3.5-flash-lite.
+    gemini-flash-latest: gemini-3.5-flash-lite
 
   quota_table:
-    gemini-3.1-flash-lite-preview: {rpm: 15, tpm: 1000000, rpd: 500}
-    gemini-3.1-flash-preview: {rpm: 15, tpm: 1000000, rpd: 500}
-    gemini-3-flash-preview: {rpm: 15, tpm: 1000000, rpd: 500}
-    gemini-2.5-flash-lite: {rpm: 15, tpm: 1000000, rpd: 500}
-    gemini-2.5-flash: {rpm: 15, tpm: 1000000, rpd: 500}
+    gemini-3.1-flash-lite: {rpm: 15, tpm: 250000, rpd: 500}
+    gemini-3.5-flash-lite: {rpm: 15, tpm: 250000, rpd: 500}
+    gemini-3-flash-preview: {rpm: 5, tpm: 250000, rpd: 20}
+    gemini-3.5-flash: {rpm: 5, tpm: 250000, rpd: 20}
+    gemini-3.6-flash: {rpm: 5, tpm: 250000, rpd: 20}
     # PLACEHOLDER quota — mirrors gemini-1.5-pro's tighter pro-tier shape (pro models
-    # are typically far more rate-limited than flash on the free tier). Verify against
-    # the real Gemini API quota page for this model and correct before relying on it.
+    # are typically far more rate-limited than flash on the free tier). Not visible on
+    # the console's per-model usage page as of 2026-07-23 — verify and correct before
+    # relying on it.
     gemini-3.1-pro-preview: {rpm: 2, tpm: 32000, rpd: 50}
 
   backoff:
