@@ -1,5 +1,8 @@
 # ai-gateway
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+
 Standalone LLM gateway microservice: multi-key pool, parallel-worker-safe rate limiting,
 per-key cooldown/backoff tracking, and usage logging — over HTTP, so any repo can call it
 instead of vendoring the pool/backoff logic locally. Provider-agnostic by design — Gemini
@@ -477,3 +480,11 @@ client — no network calls or real API keys required.
 - Initial extraction from `services/support/ai/` in `socials-instagram`: FastAPI +
   Redis-backed pool/tracker/rate-limiter, Gemini provider, `/v1/generate[/media]`,
   pool/keys/usage/health endpoints, Docker Compose dev setup, test suite.
+
+## License
+
+[MIT](./LICENSE) — free to use, modify, and distribute, including commercially. No
+warranty.
+
+You are responsible for your own provider API keys and for staying within the terms of
+whichever LLM provider you point this at; the license covers this gateway's code only.
