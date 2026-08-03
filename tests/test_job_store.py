@@ -178,3 +178,59 @@ async def test_get_batch_status_shape(store):
 
     assert await store.get_batch_status("nope") is None
     assert await store.get_item(batch_id, "missing") is None
+
+
+@pytest.mark.asyncio
+async def test_purge_batch_removes_everything(store, fake_redis, redis_keys):
+    batch_id, _ = await store.create_batch("gemini", _items(3))
+    b, item_id, entry = await store.claim_next()  # item-0 now in processing + leased
+
+    assert await store.purge_batch(batch_id) is True
+
+    assert await fake_redis.exists(redis_keys.jobs_batch(batch_id)) == 0
+    assert await fake_redis.exists(redis_keys.jobs_batch_items(batch_id)) == 0
+    assert await fake_redis.exists(redis_keys.jobs_item(batch_id, "item-0")) == 0
+    assert await fake_redis.exists(redis_keys.jobs_item(batch_id, "item-1")) == 0
+    assert await fake_redis.exists(redis_keys.jobs_lease(b, item_id)) == 0
+    assert await store.queue_length() == 0  # item-1, item-2 removed from queue
+    assert await fake_redis.lrange(redis_keys.jobs_processing(), 0, -1) == []  # item-0 removed
+    assert await fake_redis.zscore(redis_keys.jobs_all_batches(), batch_id) is None
+
+    # Purging a batch that doesn't exist (or already purged) is a no-op, not an error.
+    assert await store.purge_batch(batch_id) is False
+    assert await store.purge_batch("never-existed") is False
+
+
+@pytest.mark.asyncio
+async def test_purge_batch_leaves_other_batches_untouched(store, fake_redis, redis_keys):
+    stale_id, _ = await store.create_batch("gemini", _items(2))
+    healthy_id, _ = await store.create_batch("gemini", _items(2))
+
+    await store.purge_batch(stale_id)
+
+    assert await fake_redis.exists(redis_keys.jobs_batch(healthy_id)) == 1
+    assert await store.queue_length() == 2  # only healthy_id's two items remain
+    remaining = await fake_redis.lrange(redis_keys.jobs_queue(), 0, -1)
+    assert all(entry.startswith(healthy_id) for entry in remaining)
+
+
+@pytest.mark.asyncio
+async def test_purge_pending_only_touches_batches_with_inflight_work(store, fake_redis, redis_keys):
+    # stuck_id: one item claimed (simulates a killed worker leaving processing+lease
+    # behind) — this is the exact scenario a killed app container produces.
+    stuck_id, _ = await store.create_batch("gemini", _items(1))
+    await store.claim_next()
+
+    # done_id: fully completed, nothing left in queue/processing — must survive.
+    done_id, _ = await store.create_batch("gemini", _items(1))
+    b, item_id, entry = await store.claim_next()
+    await store.mark_running(b, item_id)
+    await store.finish_item(b, item_id, entry, success=True, result_fields={"text": "ok"})
+
+    purged = await store.purge_pending()
+
+    assert purged == [stuck_id]
+    assert await fake_redis.exists(redis_keys.jobs_batch(stuck_id)) == 0
+    assert await fake_redis.exists(redis_keys.jobs_batch(done_id)) == 1  # untouched
+    assert await store.queue_length() == 0
+    assert await fake_redis.lrange(redis_keys.jobs_processing(), 0, -1) == []

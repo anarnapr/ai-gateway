@@ -252,6 +252,49 @@ class JobStore:
     async def queue_length(self) -> int:
         return await self.redis.llen(self.rk.jobs_queue())
 
+    # ---------- purge (manual admin cleanup) ----------
+
+    async def purge_batch(self, batch_id: str) -> bool:
+        """Wipe one batch entirely: item hashes, leases, batch hash, the
+        batch's item-id list, any queue/processing entries still referencing it,
+        and its jobs:all_batches index entry. Used for stale/orphaned batches
+        left behind by a killed app process (leases outlive the container).
+        Returns False if the batch didn't exist.
+        """
+        if not await self.redis.exists(self.rk.jobs_batch(batch_id)):
+            return False
+
+        item_ids = await self.redis.lrange(self.rk.jobs_batch_items(batch_id), 0, -1)
+
+        pipe = self.redis.pipeline(transaction=True)
+        for item_id in item_ids:
+            entry = _entry(batch_id, item_id)
+            pipe.lrem(self.rk.jobs_queue(), 0, entry)
+            pipe.lrem(self.rk.jobs_processing(), 0, entry)
+            pipe.delete(self.rk.jobs_lease(batch_id, item_id))
+            pipe.delete(self.rk.jobs_item(batch_id, item_id))
+        pipe.delete(self.rk.jobs_batch(batch_id))
+        pipe.delete(self.rk.jobs_batch_items(batch_id))
+        pipe.zrem(self.rk.jobs_all_batches(), batch_id)
+        await pipe.execute()
+        return True
+
+    async def purge_pending(self) -> list[str]:
+        """Purge every batch with anything still sitting in jobs:queue or
+        jobs:processing right now — the "kill whatever's stuck" operation.
+        Safe to run whether or not the app is up; only touches queue/processing
+        entries and their batches, never batches with nothing in-flight.
+        Returns the list of batch_ids purged.
+        """
+        queued = await self.redis.lrange(self.rk.jobs_queue(), 0, -1)
+        processing = await self.redis.lrange(self.rk.jobs_processing(), 0, -1)
+        batch_ids = {_split_entry(e)[0] for e in queued + processing}
+        purged = []
+        for batch_id in batch_ids:
+            if await self.purge_batch(batch_id):
+                purged.append(batch_id)
+        return purged
+
     # ---------- status (API side) ----------
 
     async def list_batches(self) -> list[dict[str, Any]]:
