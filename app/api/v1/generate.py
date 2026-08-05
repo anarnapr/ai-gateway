@@ -34,6 +34,70 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+
+DISCONNECT_POLL_INTERVAL_SECONDS = 0.05
+
+
+async def _abort_if_disconnected(request: Optional[Request], request_id: str) -> None:
+    """Stop work immediately when the caller's HTTP connection has already dropped.
+
+    FastAPI request objects expose this on the request lifecycle, which lets the
+    generate worker turn a silent client-netdrop into a bounded cancellation instead
+    of continuing to consume provider/key resources on a request nobody is reading.
+    """
+    if request is None:
+        return
+    try:
+        if await request.is_disconnected():
+            logger.warning("Client disconnected for request %s; aborting generate work.", request_id)
+            raise asyncio.CancelledError(f"Client disconnected for request {request_id}")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("disconnect probe failed for request %s: %s", request_id, exc)
+
+
+async def _watch_for_disconnect(request: Request, request_id: str) -> None:
+    """Poll until the client disconnects, then return.
+
+    Runs as the monitor side of `_cancelable_call`'s `asyncio.wait` — it must not
+    return until an actual disconnect is observed, or the race would treat "monitor
+    finished a single check" as "client disconnected" and cancel every request.
+    """
+    while not await request.is_disconnected():
+        await asyncio.sleep(DISCONNECT_POLL_INTERVAL_SECONDS)
+    logger.warning("Client disconnected for request %s; aborting generate work.", request_id)
+
+
+async def _cancelable_call(awaitable, *, request: Optional[Request], request_id: str):
+    """Run an awaitable but abort early if the underlying client disconnects.
+
+    This keeps the HTTP request path from burning provider time after the socket has
+    already been dropped by the caller. The watcher runs alongside the work and
+    cancels the awaited task if the disconnect signal arrives first.
+    """
+    if request is None:
+        return await awaitable
+
+    monitor = asyncio.create_task(_watch_for_disconnect(request, request_id))
+    try:
+        done, pending = await asyncio.wait({asyncio.create_task(awaitable), monitor}, return_when=asyncio.FIRST_COMPLETED)
+        if monitor in done:
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            raise asyncio.CancelledError(f"Client disconnected for request {request_id}")
+
+        task = next(iter(done - {monitor}))
+        for other in pending:
+            other.cancel()
+            await asyncio.gather(other, return_exceptions=True)
+        return await task
+    finally:
+        monitor.cancel()
+        await asyncio.gather(monitor, return_exceptions=True)
+
+
 async def _raise_pool_error(pool: AsyncAPIKeyPool, request_id: str, provider_name: str) -> None:
     status = await pool.get_pool_status()
     key_statuses = []
@@ -96,6 +160,7 @@ async def run_generate(
     media_paths: Optional[list[str]] = None,
     deadline_seconds: Optional[float] = None,
     redis_client=None,
+    request: Optional[Request] = None,
 ) -> GenerateResponse:
     model = provider.resolve_model(req.model)
     # A caller-supplied model pins the pool to that model only — no cross-model
@@ -134,6 +199,7 @@ async def run_generate(
             leased_key: Optional[str] = None
             attempt_model = model
 
+            await _abort_if_disconnected(request, request_id)
             if time.monotonic() >= deadline:
                 await _raise_pool_error(pool, request_id, provider.name)
 
@@ -168,7 +234,12 @@ async def run_generate(
                         if not requires_upload_by_path[p]:
                             continue
                         try:
-                            uploaded_refs[p] = await provider.upload_media(p, key)
+                            await _abort_if_disconnected(request, request_id)
+                            uploaded_refs[p] = await _cancelable_call(
+                                provider.upload_media(p, key),
+                                request=request,
+                                request_id=request_id,
+                            )
                             await tracker.record_call(
                                 provider.name, "upload", attempt_model, key_suffix(key), True, "uploaded", total_tokens=0
                             )
@@ -222,7 +293,12 @@ async def run_generate(
                     extra={"uploaded_refs": uploaded_refs} if uploaded_refs else {},
                 )
 
-                result = await provider.generate(ctx)
+                await _abort_if_disconnected(request, request_id)
+                result = await _cancelable_call(
+                    provider.generate(ctx),
+                    request=request,
+                    request_id=request_id,
+                )
 
                 await tracker.record_call(
                     provider.name,
@@ -376,6 +452,7 @@ async def generate(request: Request, req: GenerateRequest) -> GenerateResponse:
         usage_logger=usage_logger,
         settings=settings,
         redis_client=get_redis_client(request),
+        request=request,
     )
 
 

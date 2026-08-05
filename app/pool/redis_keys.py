@@ -70,8 +70,13 @@ class RedisKeys:
 
     def jobs_batch(self, batch_id: str) -> str:
         """HASH: status/total/provider/created_at/finished_at + HINCRBY counters
-        (queued/awaiting_media/running/succeeded/failed)."""
+        (queued/awaiting_media/running/succeeded/failed/cancelled)."""
         return f"{self.prefix}:jobs:batch:{batch_id}"
+
+    def jobs_cancel(self, batch_id: str) -> str:
+        """STRING flag set by JobStore.cancel_batch(). Presence signals in-flight
+        workers to stop retrying/dequeuing further work for this batch."""
+        return f"{self.prefix}:jobs:cancel:{batch_id}"
 
     def jobs_all_batches(self) -> str:
         """ZSET of all batch_ids scored by created_at, for GET /jobs (list-all).

@@ -1,3 +1,4 @@
+import asyncio
 import io
 import time
 from pathlib import Path
@@ -16,6 +17,18 @@ def _poll_until_completed(client, batch_id: str, timeout: float = 5.0) -> dict:
             return body
         time.sleep(0.05)
     raise AssertionError(f"Batch {batch_id} did not complete within {timeout}s: {body}")
+
+
+def _poll_until_terminal(client, batch_id: str, timeout: float = 5.0) -> dict:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        resp = client.get(f"/v1/jobs/{batch_id}")
+        assert resp.status_code == 200
+        body = resp.json()
+        if body["status"] in ("completed", "cancelled"):
+            return body
+        time.sleep(0.05)
+    raise AssertionError(f"Batch {batch_id} did not reach a terminal status within {timeout}s: {body}")
 
 
 def test_text_batch_completes_in_order_with_metadata(jobs_api_client, monkeypatch):
@@ -242,3 +255,93 @@ def test_sync_generate_still_works_with_workers_running(jobs_api_client, monkeyp
     resp = jobs_api_client.post("/v1/generate", json={"prompt": "hi"})
     assert resp.status_code == 200
     assert resp.json()["text"] == "sync ok"
+
+
+# ---------------------------------------------------------------------------
+# Cancel (POST /v1/jobs/{batch_id}/cancel)
+# ---------------------------------------------------------------------------
+
+
+def test_cancel_batch_drops_queued_items_and_lets_running_ones_finish(jobs_api_client, monkeypatch):
+    """4 worker slots, 6 items, but only 2 fixture API keys: the first 4 items get
+    claimed (status -> running) almost immediately, but only 2 actually hold a key
+    and are inside a slow generate call when cancel lands; the other 2 are marked
+    running yet still waiting their turn on `acquire_key`. Cancelling here must:
+      - drop the 2 still-QUEUED items straight out of the queue (never claimed), and
+      - stop the 2 RUNNING-but-not-yet-generating items before they ever call
+        acquire_key (they never even spend an attempt), and
+      - let the 2 that already started generating finish their in-flight call.
+    Net: only the pool's real concurrency (2) gets to finish; everything else is
+    cancelled before spending any provider/key time — the whole point of this
+    endpoint. The batch's overall terminal status reflects the cancel even though
+    some items succeeded.
+    """
+
+    async def fake_generate(self, ctx):
+        await asyncio.sleep(0.3)
+        return ProviderResult(text=f"echo:{ctx.prompt_text}", total_tokens=1)
+
+    monkeypatch.setattr(GeminiProvider, "generate", fake_generate)
+
+    resp = jobs_api_client.post(
+        "/v1/jobs",
+        json={"items": [{"item_id": f"i{n}", "prompt": f"p{n}"} for n in range(6)]},
+    )
+    assert resp.status_code == 201
+    batch_id = resp.json()["batch_id"]
+
+    # `running` is set the instant a worker claims an item (mark_running), before it
+    # even waits on a key — poll for the count instead of guessing a sleep duration,
+    # so the cancel always lands after exactly the 4 worker slots have claimed theirs.
+    deadline = time.time() + 5.0
+    running = 0
+    while time.time() < deadline:
+        body = jobs_api_client.get(f"/v1/jobs/{batch_id}").json()
+        running = body["counts"]["running"]
+        if running >= 4:
+            break
+        time.sleep(0.02)
+    assert running == 4, f"expected 4 items running before cancel, got {running}"
+
+    cancel_resp = jobs_api_client.post(f"/v1/jobs/{batch_id}/cancel")
+    assert cancel_resp.status_code == 200
+
+    result = _poll_until_terminal(jobs_api_client, batch_id)
+    assert result["status"] == "cancelled"
+    assert result["counts"]["cancelled"] == 4
+    assert result["counts"]["succeeded"] == 2
+    assert result["counts"]["failed"] == 0
+
+    by_status = {i["status"] for i in result["items"]}
+    assert by_status == {"succeeded", "cancelled"}
+    cancelled_items = [i for i in result["items"] if i["status"] == "cancelled"]
+    assert all(i["error_code"] == "cancelled" for i in cancelled_items)
+    # The 2 that were "running" but hadn't started generating yet never spent an
+    # attempt — they were caught before ever calling acquire_key.
+    assert all(i["attempts"] == 0 for i in cancelled_items)
+
+
+def test_cancel_unknown_batch_returns_404(jobs_api_client):
+    resp = jobs_api_client.post("/v1/jobs/does-not-exist/cancel")
+    assert resp.status_code == 404
+
+
+def test_cancel_already_completed_batch_is_idempotent(jobs_api_client, monkeypatch):
+    async def fake_generate(self, ctx):
+        return ProviderResult(text="done", total_tokens=1)
+
+    monkeypatch.setattr(GeminiProvider, "generate", fake_generate)
+
+    resp = jobs_api_client.post("/v1/jobs", json={"items": [{"item_id": "a", "prompt": "hi"}]})
+    batch_id = resp.json()["batch_id"]
+    completed = _poll_until_completed(jobs_api_client, batch_id)
+    assert completed["counts"]["succeeded"] == 1
+
+    cancel_resp = jobs_api_client.post(f"/v1/jobs/{batch_id}/cancel")
+    assert cancel_resp.status_code == 200
+    body = cancel_resp.json()
+    # A batch that already finished on its own stays "completed" — cancel on a
+    # terminal batch is a no-op, not a way to relabel history as "cancelled".
+    assert body["status"] == "completed"
+    assert body["counts"]["succeeded"] == 1
+    assert body["counts"]["cancelled"] == 0

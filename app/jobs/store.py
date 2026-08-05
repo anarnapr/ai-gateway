@@ -13,7 +13,7 @@ from app.models.jobs import BatchStatus, ItemStatus
 from app.pool.redis_keys import RedisKeys
 from app.tracking import stats
 
-_COUNTER_FIELDS = ("awaiting_media", "queued", "running", "succeeded", "failed")
+_COUNTER_FIELDS = ("awaiting_media", "queued", "running", "succeeded", "failed", "cancelled")
 
 
 def _entry(batch_id: str, item_id: str) -> str:
@@ -68,6 +68,7 @@ class JobStore:
                 "running": 0,
                 "succeeded": 0,
                 "failed": 0,
+                "cancelled": 0,
             },
         )
         pipe.expire(self.rk.jobs_batch(batch_id), initial_ttl)
@@ -162,14 +163,22 @@ class JobStore:
         result_fields: Optional[dict[str, Any]] = None,
         error: Optional[str] = None,
         error_code: Optional[str] = None,
+        cancelled: bool = False,
     ) -> bool:
         """Terminal transition. Removes the processing entry + lease, writes the
         result, bumps counters, and marks the batch completed when the last item
         lands. Returns True if this call completed the batch.
+
+        `cancelled=True` is the worker-side half of a client cancel request: the
+        item stopped because JobStore.cancel_batch() set the cancel flag, not
+        because it actually succeeded or failed generating. Still counted via
+        `stats.record_job_item_outcome` as a failure (keeps that dashboard schema
+        unchanged) but lands in its own `cancelled` batch counter/status so callers
+        can tell "cancelled" apart from "errored".
         """
         await stats.record_job_item_outcome(self.redis, self.rk, success, error_code)
 
-        status = ItemStatus.SUCCEEDED if success else ItemStatus.FAILED
+        status = ItemStatus.CANCELLED if cancelled else (ItemStatus.SUCCEEDED if success else ItemStatus.FAILED)
         mapping: dict[str, Any] = {"status": status.value, "finished_at": time.time()}
         if result_fields:
             mapping.update({k: v for k, v in result_fields.items() if v is not None})
@@ -186,9 +195,9 @@ class JobStore:
         pipe.hincrby(self.rk.jobs_batch(batch_id), status.value, 1)
         await pipe.execute()
 
-        counts = await self.redis.hmget(self.rk.jobs_batch(batch_id), ["succeeded", "failed", "total"])
-        succeeded, failed, total = (int(c) if c else 0 for c in counts)
-        if total > 0 and succeeded + failed >= total:
+        counts = await self.redis.hmget(self.rk.jobs_batch(batch_id), ["succeeded", "failed", "cancelled", "total"])
+        succeeded, failed, cancelled, total = (int(c) if c else 0 for c in counts)
+        if total > 0 and succeeded + failed + cancelled >= total:
             await self._complete_batch(batch_id)
             return True
         return False
@@ -196,11 +205,15 @@ class JobStore:
     async def _complete_batch(self, batch_id: str) -> None:
         # Idempotent — a race between two finishing workers just rewrites the same
         # fields. Refresh all batch keys down to the result TTL now that it's done.
+        # A batch that was cancel-requested finishes as CANCELLED even if every item
+        # that was still running when the cancel arrived went on to succeed/fail on
+        # its own — the client asked to stop, so the terminal status reflects that.
+        final_status = BatchStatus.CANCELLED if await self.is_cancelled(batch_id) else BatchStatus.COMPLETED
         ttl = self.settings.jobs_result_ttl_seconds
         pipe = self.redis.pipeline(transaction=True)
         pipe.hset(
             self.rk.jobs_batch(batch_id),
-            mapping={"status": BatchStatus.COMPLETED.value, "finished_at": time.time()},
+            mapping={"status": final_status.value, "finished_at": time.time()},
         )
         pipe.expire(self.rk.jobs_batch(batch_id), ttl)
         pipe.expire(self.rk.jobs_batch_items(batch_id), ttl)
@@ -251,6 +264,63 @@ class JobStore:
 
     async def queue_length(self) -> int:
         return await self.redis.llen(self.rk.jobs_queue())
+
+    # ---------- cancel (client-triggered, keeps results) ----------
+
+    async def is_cancelled(self, batch_id: str) -> bool:
+        return bool(await self.redis.exists(self.rk.jobs_cancel(batch_id)))
+
+    async def cancel_batch(self, batch_id: str) -> Optional[dict[str, Any]]:
+        """Stop a batch a client no longer wants: drop everything not yet started
+        (queued/awaiting_media items are dequeued/marked CANCELLED immediately) and
+        set a cancel flag so any RUNNING item's worker stops retrying the next time
+        it checks (top of `JobWorkerPool._process_item`'s loop) instead of burning
+        further attempts. Unlike `purge_batch` (admin, deletes everything), this
+        keeps item results/history — items that already succeeded/failed stay as-is.
+        Idempotent: re-cancelling an already-terminal batch is a no-op that just
+        returns its current status. Returns None if the batch doesn't exist.
+        """
+        batch = await self.redis.hgetall(self.rk.jobs_batch(batch_id))
+        if not batch:
+            return None
+        if batch.get("status") in (BatchStatus.COMPLETED.value, BatchStatus.CANCELLED.value):
+            return await self.get_batch_status(batch_id)
+
+        ttl = await self.redis.ttl(self.rk.jobs_batch(batch_id))
+        cancel_ttl = ttl if ttl and ttl > 0 else self.settings.jobs_result_ttl_seconds * 2
+        await self.redis.set(self.rk.jobs_cancel(batch_id), "1", ex=cancel_ttl)
+
+        item_ids = await self.redis.lrange(self.rk.jobs_batch_items(batch_id), 0, -1)
+        for item_id in item_ids:
+            raw = await self.redis.hgetall(self.rk.jobs_item(batch_id, item_id))
+            status = raw.get("status")
+            if status not in (ItemStatus.QUEUED.value, ItemStatus.AWAITING_MEDIA.value):
+                continue  # RUNNING -> worker will catch the flag; terminal -> already done
+
+            pipe = self.redis.pipeline(transaction=True)
+            if status == ItemStatus.QUEUED.value:
+                pipe.lrem(self.rk.jobs_queue(), 0, _entry(batch_id, item_id))
+            pipe.hset(
+                self.rk.jobs_item(batch_id, item_id),
+                mapping={
+                    "status": ItemStatus.CANCELLED.value,
+                    "error": "Batch cancelled by client.",
+                    "error_code": "cancelled",
+                    "finished_at": time.time(),
+                },
+            )
+            pipe.hincrby(self.rk.jobs_batch(batch_id), status, -1)
+            pipe.hincrby(self.rk.jobs_batch(batch_id), "cancelled", 1)
+            await pipe.execute()
+
+        counts = await self.redis.hmget(
+            self.rk.jobs_batch(batch_id), ["succeeded", "failed", "cancelled", "running", "total"]
+        )
+        succeeded, failed, cancelled, running, total = (int(c) if c else 0 for c in counts)
+        if running == 0 and total > 0 and succeeded + failed + cancelled >= total:
+            await self._complete_batch(batch_id)
+
+        return await self.get_batch_status(batch_id)
 
     # ---------- purge (manual admin cleanup) ----------
 
