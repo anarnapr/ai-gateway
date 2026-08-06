@@ -1,3 +1,9 @@
+import asyncio
+
+import pytest
+
+from app.api.v1.generate import run_generate
+from app.models.requests import GenerateRequest
 from app.providers.base import ProviderResult
 from app.providers.gemini.provider import GeminiProvider
 
@@ -106,6 +112,48 @@ def test_generate_default_timeout_applied_and_rotates_on_hang(api_client, monkey
     assert resp.json()["attempts"] == 2
     # Server default timeout was injected (not None), so the SDK call is bounded.
     assert all(t and t > 0 for t in seen["timeouts"])
+
+
+def test_generate_aborts_when_client_disconnects(api_client, monkeypatch):
+    """If the HTTP client drops mid-flight, the request loop must abort instead of
+    continuing to spend key/provider time on a disconnected request.
+    """
+
+    class FakeRequest:
+        def __init__(self):
+            self.disconnected = False
+
+        async def is_disconnected(self):
+            return self.disconnected
+
+    async def fake_generate(self, ctx):
+        await asyncio.sleep(0.2)
+        return ProviderResult(text="should not finish", input_tokens=1, output_tokens=1, total_tokens=2)
+
+    monkeypatch.setattr(GeminiProvider, "generate", fake_generate)
+
+    async def _exercise():
+        request = FakeRequest()
+
+        async def _flip_disconnect():
+            await asyncio.sleep(0.01)
+            request.disconnected = True
+
+        asyncio.get_running_loop().create_task(_flip_disconnect())
+        with pytest.raises(asyncio.CancelledError):
+            await run_generate(
+                request_id="req-disconnect",
+                req=GenerateRequest(prompt="hi"),
+                provider=api_client.app.state.provider_registry.get("gemini"),
+                pool=api_client.app.state.pools["gemini"],
+                tracker=api_client.app.state.trackers["gemini"],
+                rate_limiter=api_client.app.state.rate_limiters["gemini"],
+                usage_logger=api_client.app.state.usage_logger,
+                settings=api_client.app.state.settings,
+                request=request,
+            )
+
+    asyncio.run(_exercise())
 
 
 # ---------------------------------------------------------------------------

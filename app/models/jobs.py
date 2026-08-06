@@ -14,12 +14,14 @@ class ItemStatus(str, Enum):
     RUNNING = "running"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 class BatchStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
+    CANCELLED = "cancelled"
 
 
 class JobItemSpec(BaseModel):
@@ -81,7 +83,7 @@ class JobItemResult(BaseModel):
     status: ItemStatus
     text: Optional[str] = None
     error: Optional[str] = None
-    error_code: Optional[str] = None  # generate_failed | pool_exhausted | all_keys_dead
+    error_code: Optional[str] = None  # generate_failed | pool_exhausted | all_keys_dead | cancelled
     attempts: int = 0
     input_tokens: Optional[int] = None
     output_tokens: Optional[int] = None

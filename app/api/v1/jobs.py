@@ -102,6 +102,19 @@ async def upload_item_media(request: Request, batch_id: str, item_id: str, file:
     return {"item_id": item_id, "status": ItemStatus.QUEUED.value}
 
 
+@router.post("/jobs/{batch_id}/cancel", response_model=BatchStatusResponse)
+async def cancel_batch(request: Request, batch_id: str) -> BatchStatusResponse:
+    """Stop a batch the client no longer wants results from. Queued/awaiting-media
+    items are dropped immediately; items already RUNNING finish (or fail) their
+    current attempt, then stop instead of retrying. Already-completed items keep
+    their results. Idempotent — cancelling an already-terminal batch just returns
+    its current status."""
+    status = await get_job_store(request).cancel_batch(batch_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="Unknown or expired batch.")
+    return BatchStatusResponse(**status)
+
+
 @router.get("/jobs", response_model=list[BatchSummary])
 async def list_batches(request: Request) -> list[BatchSummary]:
     summaries = await get_job_store(request).list_batches()

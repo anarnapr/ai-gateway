@@ -185,6 +185,14 @@ class JobWorkerPool:
                 return
 
         while True:
+            if await self.store.is_cancelled(batch_id):
+                await self.store.finish_item(
+                    batch_id, item_id, entry, success=False, cancelled=True,
+                    error="Batch cancelled by client.", error_code="cancelled",
+                )
+                self._cleanup_media(batch_id, item_id)
+                return
+
             try:
                 resp = await run_generate(
                     request_id=f"{batch_id}:{item_id}:{attempts}",
