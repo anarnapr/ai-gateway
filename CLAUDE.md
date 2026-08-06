@@ -15,6 +15,7 @@ added later without redesigning the pool/tracker layer.
 - **Test**: `pytest -v` (uses `fakeredis` + mocked `google.genai` — no real Redis/keys needed)
 - **Dashboard**: `python scripts/quota_dashboard.py --url http://localhost:8080 --watch`
 - **Prune logs**: `python scripts/prune_logs.py --days 14`
+- **Purge stuck jobs**: `python scripts/kill_jobs.py [--batch <id> | --all] [--dry-run]`
 
 ## Code Style
 - **Provider abstraction**: All provider-specific logic (model list, error-string
@@ -67,6 +68,31 @@ added later without redesigning the pool/tracker layer.
   local filesystem — the ONE piece of shared state outside Redis. Fine single-host;
   multi-host workers need a shared volume. The worker deletes the dir only on terminal
   success/failure, never on requeue.
+- **Cancel is client-facing and preserves results; purge is admin-facing and deletes
+  everything.** `POST /v1/jobs/{batch_id}/cancel` → `JobStore.cancel_batch()` sets a
+  `jobs:cancel:{batch_id}` flag, drops queued/awaiting_media items immediately, and
+  leaves `running` items alone — `JobWorkerPool._process_item()` checks
+  `store.is_cancelled(batch_id)` at the top of its retry loop and stops before
+  starting a new attempt instead of hard-killing an in-flight call. Already-finished
+  items keep their results; `_complete_batch()` sets the batch's final status to
+  `CANCELLED` (not `COMPLETED`) whenever `is_cancelled()` is true, even if every item
+  still `running` at cancel time went on to succeed/fail on its own. `scripts/kill_jobs.py`
+  (`JobStore.purge_batch()`/`purge_pending()`) is the opposite tool — an operator CLI
+  that talks to Redis directly (works with the app down) and wipes a batch's item
+  hashes, leases, queue/processing entries, and index entry entirely. Don't conflate
+  the two: cancel is a normal API request a client can make; purge is for clearing
+  stuck state a killed container left behind.
+- **Sync `/v1/generate` aborts on client disconnect, batch workers don't (they can't).**
+  `run_generate` (`app/api/v1/generate.py`) takes an optional `request: Request` —
+  when present, `_abort_if_disconnected()` checks `request.is_disconnected()` before
+  each retry attempt/key acquire, and `_cancelable_call()` races a
+  `_watch_for_disconnect()` polling task (50ms interval) against the in-flight
+  upload/generate awaitable via `asyncio.wait(..., return_when=FIRST_COMPLETED)`,
+  cancelling whichever loses. The jobs worker calls `run_generate` without a `request`
+  (there's no live HTTP connection to poll — the client already disconnected after
+  submit by design), so this path is a no-op there; batches use the cancel endpoint
+  above instead. Any new caller of `run_generate` on a live HTTP request path should
+  thread `request` through for the same reason `/v1/generate` does.
 
 ## Known Gotchas
 - **Classify by stored reason, not cooldown duration.** `classify_key_status`'s global
@@ -119,6 +145,17 @@ added later without redesigning the pool/tracker layer.
   `tests/test_api_generate.py::test_generate_with_pinned_model_uses_that_model` /
   `test_generate_with_unknown_model_returns_422`. Any future change to `acquire_key()`
   must keep threading the caller's model through — don't let this regress silently.
+- **A model 404 (`NOT_FOUND`) is scoped per-key, not pool-wide, since 2026-07-27.** A
+  Gemini "model not found" / "no longer available to new users" 404 reflects the
+  *calling key's own Google Cloud project* not having that model — sibling projects
+  created at different times routinely differ on which models they can see.
+  `classify_gemini_error()` (`app/providers/gemini/errors.py`) reports `NOT_FOUND` as
+  scope `key_model`, not `model`; `AsyncAPIKeyPool.report_failure()`
+  (`app/pool/key_pool.py`) cools only that key/model pair and only escalates to a
+  pool-wide `cooldown_model()` blacklist once every configured key has independently
+  confirmed the same 404 — same escalation pattern as `QUOTA_EXHAUSTED`. Don't revert
+  to a single-404-blacklists-the-model-for-everyone shortcut; that can cut a model off
+  for keys that could still legitimately use it.
 - **`redis.from_url()`'s connection pool defaults to 100 max connections** (redis-py
   default, not unlimited) — this service's fan-out (`acquire_key()` gathers a
   `leased:*` check per configured key, per candidate model, times

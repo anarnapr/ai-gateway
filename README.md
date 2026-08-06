@@ -110,17 +110,26 @@ Body: `{provider?, prompt?, parts?, model?, max_retries?, timeout_seconds?, verb
 
 `model` behavior: omit it and the gateway falls back down the full `model_priority` list
 in `config/models.yaml` as usual (aliases resolved, e.g. `gemini-3.1` →
-`gemini-3.1-flash-preview`). **Send it, and the gateway pins the request to exactly that
+`gemini-3.1-flash-lite`). **Send it, and the gateway pins the request to exactly that
 model — no cross-model fallback.** If every key is cooled down for that one model, the
 request fails (`429`/`503`) rather than silently substituting a different model. An
 unrecognized model name (not in `model_priority`, e.g. a typo or a model id that doesn't
 exist for this provider) returns `422 {"error": "unknown_model", ...}` immediately,
 before any pool/key work. Same behavior applies to batch job items' `model` field.
 
+Aborts early on client disconnect: a background watcher polls
+`request.is_disconnected()` every 50ms alongside the in-flight provider call (upload and
+generate both), plus explicit checks before each retry attempt and key acquire. If the
+caller's HTTP connection drops mid-request, the gateway cancels the in-flight provider
+call instead of running it to completion for nobody — saves provider/key time on
+abandoned requests. Only applies to the sync endpoints (`request` is threaded through);
+batch job workers call `run_generate` without a `request`, so this doesn't apply there —
+use `POST /v1/jobs/{batch_id}/cancel` for batches instead (below).
+
 Response `200`:
 ```json
 {
-  "request_id": "...", "provider": "gemini", "model": "gemini-2.5-flash",
+  "request_id": "...", "provider": "gemini", "model": "gemini-3.1-flash-lite",
   "text": "...", "input_tokens": 12, "output_tokens": 8, "total_tokens": 20,
   "api_key_suffix": "a1b2", "attempts": 1, "latency_ms": 812.4
 }
@@ -212,19 +221,33 @@ submit a batch, let the gateway's internal worker pool (`JOBS_WORKER_CONCURRENCY
    `queued`; processing starts immediately (no need to finish all uploads first). `409`
    if the item isn't awaiting media.
 3. **`GET /v1/jobs/{batch_id}`** — `{status, counts, items: [...]}` in submit order.
-   Poll until `status == "completed"`. Succeeded items carry `text`/token counts;
-   failed items carry `error` + `error_code` (`generate_failed` | `pool_exhausted` |
-   `all_keys_dead`) — items are never silently dropped. Results expire after 24h
+   Poll until `status == "completed"` (or `"cancelled"`, see below). Succeeded items
+   carry `text`/token counts; failed items carry `error` + `error_code`
+   (`generate_failed` | `pool_exhausted` | `all_keys_dead` | `media_fetch_failed` |
+   `cancelled`) — items are never silently dropped. Results expire after 24h
    (`JOBS_RESULT_TTL_SECONDS`).
 4. `GET /v1/jobs/{batch_id}/items/{item_id}` — single-item view (debugging).
 5. `GET /v1/jobs` — list every batch still tracked (newest first), one summary row
    each: `{batch_id, status, total, counts, created_at, finished_at}` — no per-item
    detail. Use this to see everything the gateway is currently handling without
    knowing a `batch_id` up front.
+6. **`POST /v1/jobs/{batch_id}/cancel`** — stop a batch you no longer want results
+   from. `queued`/`awaiting_media` items are dropped immediately (marked
+   `cancelled`, `error_code: cancelled`); `running` items stop retrying the next
+   time their worker loop checks the cancel flag (before starting a new attempt)
+   instead of continuing to burn capacity — it doesn't hard-kill an in-flight
+   provider call. Already-`succeeded`/`failed` items keep their results
+   untouched. Idempotent — cancelling an already-terminal batch just returns its
+   current status; `404` for an unknown/expired `batch_id`. Returns the same
+   `BatchStatusResponse` shape as `GET /v1/jobs/{batch_id}`.
 
-Item lifecycle: `awaiting_media → queued → running → succeeded | failed` (`has_media`
-items) or `queued → running → succeeded | failed` (text-only and `media_urls` items —
-no upload step to wait on). Each item runs through the same generate pipeline as the
+Item lifecycle: `awaiting_media → queued → running → succeeded | failed | cancelled`
+(`has_media` items) or `queued → running → succeeded | failed | cancelled` (text-only
+and `media_urls` items — no upload step to wait on). A batch's own `status` becomes
+`cancelled` (instead of `completed`) if `cancel` was ever called on it, even when every
+item that was still `running` at cancel time went on to finish on its own — the client
+asked to stop, so the terminal status reflects that intent, not the accidental outcome.
+Each item runs through the same generate pipeline as the
 sync endpoint (key rotation, same-key File-API media pinning, timeouts, tracking) with a
 wider per-attempt deadline (`JOBS_ITEM_DEADLINE_SECONDS`, default 300s — no HTTP client
 is waiting). Failed attempts retry server-side: real failures up to
@@ -244,6 +267,26 @@ shared volume.
 
 Deploy tip for video workloads: set `LEASE_TTL_MS=300000` — the default 120s key-lease
 TTL can expire mid-item on a 2-minute reel.
+
+**Admin cleanup — `scripts/kill_jobs.py`.** Killing the app container mid-batch leaves
+leases and `jobs:queue`/`jobs:processing` entries behind in Redis (a persisted volume),
+so the worker pool silently resumes them on next boot. This is a separate concern from
+the client-facing cancel endpoint above — it's an operator tool, talks to Redis
+directly (works whether or not the app container is up), and wipes state entirely
+rather than preserving results:
+
+```bash
+python scripts/kill_jobs.py                 # purge every batch with anything still
+                                              # queued/processing right now
+python scripts/kill_jobs.py --batch <id>     # purge one specific batch (any status)
+python scripts/kill_jobs.py --all            # purge every tracked batch (full wipe)
+python scripts/kill_jobs.py --dry-run        # show what would be purged, no writes
+```
+
+Backed by `JobStore.purge_batch()` (wipes one batch's item hashes, leases, batch hash,
+item-id list, queue/processing entries, and its `jobs:all_batches` index entry) and
+`JobStore.purge_pending()` (purges only batches with something in queue/processing
+right now, leaving completed batches untouched — the default, no-flag mode above).
 
 ### Error responses
 
@@ -324,9 +367,10 @@ failures propagating fast rather than being absorbed into a cooldown.
 | `tracker:rpm:{model}:{suffix}` / `tracker:rpd:...` / `tracker:tokens_day:...` | ZSET / STRING | `CallTracker`'s quota-table enforcement (separate from the pool's own RPM cap). |
 | `jobs:queue` / `jobs:processing` | LIST | Batch jobs work queue; claim = atomic `LMOVE`. |
 | `jobs:lease:{batch_id}:{item_id}` | STRING, EX | Worker liveness for an in-flight item; reaper requeues entries without one. |
-| `jobs:batch:{batch_id}` | HASH, EX | Batch status + `HINCRBY` counters (queued/running/succeeded/failed/…). |
+| `jobs:batch:{batch_id}` | HASH, EX | Batch status + `HINCRBY` counters (queued/running/succeeded/failed/cancelled). |
 | `jobs:batch_items:{batch_id}` | LIST, EX | Item ids in submit order. |
 | `jobs:item:{batch_id}:{item_id}` | HASH, EX | Item request, status, attempts, result/error fields. |
+| `jobs:cancel:{batch_id}` | STRING, EX | Set by `JobStore.cancel_batch()`; presence signals in-flight workers to stop retrying/dequeuing further work for this batch. |
 | `jobs:all_batches` | ZSET, scored by `created_at` | Every batch_id ever created; feeds `GET /v1/jobs` (list-all). Members for expired batches are lazily `ZREM`'d on read, not TTL'd directly. |
 | `stats:calls:{service}:{yyyymmdd}` | HASH, 90d EX | `total`/`success`/`failed` — bumped by `CallTracker.record_call()`. Feeds `GET /v1/stats`. |
 | `stats:failure_reasons:{service}:{yyyymmdd}` | HASH, 90d EX | `FailureReason.value` → count, bumped unconditionally in `AsyncAPIKeyPool.report_failure()`. |
@@ -387,6 +431,46 @@ client — no network calls or real API keys required.
 
 ## Recent changes
 
+- **Abort sync generate on client disconnect + batch job cancel endpoint**
+  (2026-08-05): sync `/v1/generate` (and `/v1/generate/media[/url]`) now stops burning
+  provider/key time as soon as the caller's HTTP connection drops, instead of running
+  the request to completion for nobody — a background watcher polls
+  `request.is_disconnected()` every 50ms alongside the in-flight upload/generate call
+  and cancels it on disconnect, with explicit checks before each retry attempt and key
+  acquire too. For batch jobs (where the client is expected to disconnect after
+  submit), added `POST /v1/jobs/{batch_id}/cancel`: queued/awaiting-media items drop
+  immediately, `running` items stop retrying the next time their worker loop checks the
+  cancel flag rather than continuing to burn capacity, already-finished items keep
+  their results, and it's idempotent on a terminal batch. New `ItemStatus.CANCELLED` /
+  `BatchStatus.CANCELLED`, new `jobs:cancel:{batch_id}` Redis flag
+  (`JobStore.is_cancelled()`/`cancel_batch()`), new `cancelled` batch counter alongside
+  `succeeded`/`failed`. 95 tests total.
+- **Batch purge for stuck/orphaned jobs** (2026-08-03): killing the app container
+  mid-batch left leases and `jobs:queue`/`jobs:processing` entries behind in Redis (a
+  persisted volume), so the worker pool silently resumed them on next boot. Added
+  `JobStore.purge_batch()` / `purge_pending()` and an operator CLI,
+  `scripts/kill_jobs.py` (`--batch <id>` / `--all` / `--dry-run`), that talks to Redis
+  directly so it works whether or not the app container is running. Distinct from the
+  cancel endpoint above — this is an admin tool that deletes state entirely rather than
+  a client-facing request that preserves results.
+- **Model-not-found (404) handling scoped per-key, not pool-wide** (2026-07-27): a
+  Gemini 404 ("model not found" / "no longer available to new users") reflects the
+  *calling key's own Google Cloud project* not having that model, not the model being
+  globally broken — sibling projects created at different times routinely differ on
+  which models they can see. `classify_gemini_error()`'s `NOT_FOUND` classification
+  changed scope from `model` to `key_model`; `AsyncAPIKeyPool.report_failure()` now
+  cools only the one key/model pair and escalates to a pool-wide `cooldown_model()`
+  blacklist only once every configured key has independently confirmed the same 404
+  (same escalation pattern already used for `QUOTA_EXHAUSTED`) — previously a single
+  key's 404 blacklisted the model for the entire pool. Also fixed a silent
+  `AttributeError` when Gemini returns `response.text is None` (safety block,
+  `RECITATION`, empty-candidate `MAX_TOKENS`) — that used to fall through as
+  `FailureReason.UNKNOWN` (no cooldown, no stop-retrying signal), hammering every other
+  key with the same rejected content; now raises a `RuntimeError` carrying the
+  `finish_reason`. Refreshed `config/models.yaml`'s `model_priority`/`quota_table`
+  against the live Google AI Studio console (2026-07-23) — see the file's own header
+  comment for the current roster; a prior version had `rpd:500/rpm:15/tpm:1M`
+  copy-pasted across every model, understating several models' real (lower) caps.
 - **Model roster update** (2026-07-19): `config/models.yaml` `model_priority` gained
   `gemini-3.1-pro-preview` (inserted after `gemini-2.5-flash`) and dropped
   `gemini-2.0-flash`, `gemini-2.0-flash-lite`, `gemini-1.5-flash`, `gemini-1.5-pro`.

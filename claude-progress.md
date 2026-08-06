@@ -1,7 +1,7 @@
 # claude-progress.md - Status
 
-> Last updated: 2026-07-19 (Model pinning fix + Redis connection pool sizing + model roster update)
-> Status: Model pinning complete; 95 tests total, 92 green (3 pre-existing local failures unrelated — `tmp/ai/uploads` permission on this machine, not a code regression)
+> Last updated: 2026-08-05 (Sync-generate disconnect abort + batch job cancel endpoint)
+> Status: Cancel/disconnect-abort complete; 95 tests total
 
 ## Current State
 `ai-gateway` is a new standalone FastAPI microservice, extracted from
@@ -219,6 +219,76 @@ dicts only worked within a single process.
   unknown-model test switched from `gemini-3.1-pro`, now valid, to
   `gemini-4-ultra-preview`); added `test_generate_with_pinned_model_pro_alias_resolves`.
   95 tests total.
+- [x] **Model-not-found (404) handling rescoped to per-key + model roster refresh**
+  (2026-07-27): a Gemini 404 ("model not found" / "no longer available to new users")
+  is a property of the *calling key's own Google Cloud project*, not the model
+  globally — sibling projects created at different times routinely differ on which
+  models they can see. `classify_gemini_error()`'s `NOT_FOUND` classification changed
+  scope from `model` to `key_model`; `AsyncAPIKeyPool.report_failure()` now cools only
+  that one key/model pair (`cooldown_keymodel`) and escalates to a pool-wide
+  `cooldown_model()` blacklist only once every configured key has independently
+  confirmed the same 404 — same escalation pattern `QUOTA_EXHAUSTED` already used.
+  Previously one key's 404 blacklisted the model for the whole pool, which could cut
+  off a model other keys could still legitimately use. Also fixed a silent
+  `AttributeError` in `GeminiProvider.generate()`: `response.text` can be `None` (SDK
+  behavior, not an exception) on a safety block / `RECITATION` / empty-candidate
+  `MAX_TOKENS` — a blind `.strip()` on that crashed, and since the resulting message
+  matched no `classify_gemini_error()` pattern it fell through as
+  `FailureReason.UNKNOWN` (no cooldown, no stop-retrying signal), so the retry loop
+  hammered every other key with the same rejected content instead of failing fast.
+  Now raises `RuntimeError(f"Gemini returned no text (finish_reason={finish_reason}).")`
+  instead. Separately, refreshed `config/models.yaml`'s `model_priority`/`model_aliases`/
+  `quota_table` against the live Google AI Studio console (2026-07-23): dropped
+  `gemini-2.5-flash` (moved to paid tier) and `gemini-3.1-flash-preview` (confirmed
+  0/33 real calls succeeding, absent from the console entirely), added
+  `gemini-3.5-flash`/`gemini-3.5-flash-lite`/`gemini-3.6-flash`, renamed
+  `gemini-3.1-flash-lite-preview` → `gemini-3.1-flash-lite` (verified live against real
+  keys), corrected `tpm` from a flat 1,000,000 (copy-pasted across every model) down to
+  each model's real console-reported cap. 88 tests total (2 new:
+  `test_not_found_does_not_blacklist_model_for_single_key`,
+  `test_not_found_blacklists_model_once_all_keys_confirm_it`).
+- [x] **Batch purge for stuck/orphaned jobs** (2026-08-03): killing the app container
+  mid-batch left leases and `jobs:queue`/`jobs:processing` entries behind in Redis (a
+  persisted volume), so `JobWorkerPool` silently resumed them on next boot — not
+  always what you want after a manual kill. Added `JobStore.purge_batch(batch_id)`
+  (wipes one batch's item hashes, leases, batch hash, item-id list,
+  queue/processing entries, and its `jobs:all_batches` index entry) and
+  `JobStore.purge_pending()` (purges only batches with something in queue/processing
+  right now, leaving completed batches untouched). New `scripts/kill_jobs.py` CLI over
+  both (`--batch <id>` / `--all` / `--dry-run`), connects to Redis directly so it works
+  whether or not the app container is up — an operator tool, distinct from the
+  client-facing cancel endpoint below (this deletes state entirely; cancel preserves
+  results). 91 tests total (3 new: full purge, isolation from other batches,
+  `purge_pending` skips finished batches — `tests/test_job_store.py`).
+- [x] **Abort sync generate on client disconnect + batch job cancel endpoint**
+  (2026-08-05): sync `/v1/generate` (and the media variants) used to run a request to
+  completion even after the caller's HTTP connection dropped, burning provider/key
+  time for nobody. Added `_watch_for_disconnect()`/`_cancelable_call()`
+  (`app/api/v1/generate.py`): a background task polls `request.is_disconnected()`
+  every `DISCONNECT_POLL_INTERVAL_SECONDS` (50ms) racing `asyncio.wait(...,
+  return_when=FIRST_COMPLETED)` against the in-flight upload/generate call, cancelling
+  whichever loses; explicit `_abort_if_disconnected()` checks also run before each
+  retry attempt and key acquire in `run_generate`'s loop. For async batch jobs, where
+  the client is *expected* to disconnect after submit, added
+  `POST /v1/jobs/{batch_id}/cancel` (`JobStore.cancel_batch()`): sets a
+  `jobs:cancel:{batch_id}` flag, immediately drops/marks-cancelled any
+  queued/awaiting_media item (dequeuing from `jobs:queue` for queued ones), and leaves
+  `running` items alone — `JobWorkerPool._process_item()`'s retry loop now checks
+  `store.is_cancelled(batch_id)` at the top of each attempt and stops instead of
+  starting a new one. Already-finished items keep their results. New
+  `ItemStatus.CANCELLED` / `BatchStatus.CANCELLED`, new `cancelled` field in
+  `_COUNTER_FIELDS`; `JobStore.finish_item()` gained a `cancelled: bool` param so the
+  worker-triggered terminal transition can distinguish "client cancelled" from a real
+  failure while still recording it as a failure in `stats.record_job_item_outcome` (dashboard
+  schema unchanged); `_complete_batch()` now sets the batch's final status to
+  `CANCELLED` (not `COMPLETED`) if `is_cancelled()` is true, even when every
+  still-`running` item at cancel time went on to succeed/fail on its own — the client
+  asked to stop, so the terminal status reflects that intent. Idempotent: re-cancelling
+  an already-terminal batch is a no-op that returns current status; unknown `batch_id`
+  → `404`. 95 tests total (4 new: `test_generate_aborts_when_client_disconnects`,
+  `test_cancel_batch_drops_queued_items_and_lets_running_ones_finish`,
+  `test_cancel_unknown_batch_returns_404`,
+  `test_cancel_already_completed_batch_is_idempotent`).
 
 ## Bugs Found & Fixed During Verification
 - [x] **Cooldown classification race**: `classify_key_status` inferred `dead_auth` vs
@@ -320,7 +390,8 @@ earlier test run) success entry and full error detail captured on failures.
   immediately when `retry_after > 300s`); still missing in `socials-instagram`'s copy.
 - Jobs API client helpers (`submit_batch` / `poll_batch`) in the caller repos.
 - Harden the upload ACTIVE-poll against transient 429s (see Operational Notes).
-- Cancel endpoint / webhooks for jobs (polling-only v1).
+- Webhooks for jobs (cancel is done as of 2026-08-05 — see milestone above; still
+  polling-only for completion notification, no push).
 - Second provider (Anthropic, etc.) — only the `Provider` interface exists.
 - No hot-reload of `config/models.yaml`.
 - No production deployment topology beyond the dev `Dockerfile`/`docker-compose.yml`;

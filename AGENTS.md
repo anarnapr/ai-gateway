@@ -72,7 +72,8 @@ gemini/
 │   ├── tracking/                 # CallTracker (rpm/tpm/rpd quota), UsageLogger (JSONL)
 │   └── rate_limit/               # per-key throttle
 ├── config/models.yaml           # model priority / aliases / quota table (per provider)
-├── scripts/                     # quota_dashboard.py (rich CLI), prune_logs.py
+├── scripts/                     # quota_dashboard.py (rich CLI), prune_logs.py,
+│                                 #   kill_jobs.py (admin batch purge)
 ├── tests/                       # fakeredis + mocked SDK, no real Redis/keys needed
 └── tmp/ai/logs, tmp/ai/uploads   # runtime state, gitignored
 ```
@@ -92,6 +93,14 @@ gemini/
   get the pool to fall back to the next model — see
   `AsyncAPIKeyPool._maybe_trip_model_breaker()` in `app/pool/key_pool.py` and the
   `MODEL_CIRCUIT_BREAKER_*` settings.
+- **A model 404 (`NOT_FOUND`) is scoped per-key, not pool-wide.** It reflects the
+  calling key's own Google Cloud project not having that model, not the model being
+  globally broken — sibling projects differ on which models they can see.
+  `classify_gemini_error()` reports it as scope `key_model`; `report_failure()` cools
+  only that key/model pair and only blacklists the model pool-wide once every
+  configured key has independently hit the same 404 (mirrors `QUOTA_EXHAUSTED`'s
+  escalation). Don't go back to a single key's 404 blacklisting the model for
+  everyone — that can cut off a model other keys could still use.
 - **`FailureReason.UNKNOWN` stays uncooled in `report_failure()`.** The jobs worker
   needs unclassified failures to propagate as a real exception (bounded item retries →
   `generate_failed`), not get absorbed into the pool's capacity-retry path. See the
@@ -100,6 +109,22 @@ gemini/
   `Retry-After` HTTP header, every time.
 - **Keep `acquire_key()` bounded** (`ACQUIRE_KEY_MAX_WAIT_SECONDS`) — this is an HTTP
   service, not a batch job; don't hold connections open for long backoffs.
+- **Cancel (`POST /v1/jobs/{batch_id}/cancel`) vs purge (`scripts/kill_jobs.py`)**:
+  cancel is client-facing and keeps results — `JobStore.cancel_batch()` sets a
+  `jobs:cancel:{batch_id}` flag, drops queued/awaiting_media items immediately, and
+  lets `running` items finish their current attempt (`JobWorkerPool._process_item()`
+  checks `store.is_cancelled()` at the top of its retry loop, before starting a new
+  attempt, not by hard-killing an in-flight call). Purge is an admin CLI that talks to
+  Redis directly and deletes a batch's state entirely (item hashes, leases,
+  queue/processing entries) — for stuck/orphaned batches a killed container left
+  behind, not for a client that just wants to stop. Don't merge the two code paths.
+- **Sync generate aborts on client disconnect; batch workers can't (and shouldn't
+  try).** `run_generate` takes an optional `request: Request` — when present, it polls
+  `request.is_disconnected()` before each retry/key-acquire and races the in-flight
+  upload/generate call against a disconnect watcher. The jobs worker calls
+  `run_generate` without `request` (the client is expected to have already
+  disconnected after submitting a batch) — use the cancel endpoint above for batches,
+  don't try to thread a `request` through the worker.
 - **Batch jobs rules** (`app/jobs/`): workers are asyncio tasks started/stopped in the
   `app/main.py` lifespan (never FastAPI `BackgroundTasks`); they must reuse
   `run_generate` from `app/api/v1/generate.py`, never a second pipeline. No blocking
