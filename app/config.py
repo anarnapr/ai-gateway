@@ -111,6 +111,20 @@ class Settings(BaseSettings):
     jobs_max_items_per_batch: int = 200
     jobs_shutdown_grace_seconds: float = 5.0
 
+    # Queue lifecycle across restarts. By default the Redis-backed queue is durable:
+    # whatever was queued/in-flight when the process died is resumed on next boot (the
+    # reaper's boot sweep requeues orphaned processing entries). Set these when you'd
+    # rather a container restart start from a clean slate than silently resume — and
+    # burn provider quota on — work nobody is waiting for any more.
+    #   on_shutdown: only fires on a graceful stop (SIGTERM + lifespan teardown).
+    #   on_startup:  also covers hard kills (SIGKILL/OOM/`docker kill`), where no
+    #                shutdown hook ever runs. Enable this one if you want the guarantee.
+    # Both purge via JobStore.purge_pending(), which deletes the WHOLE batch for
+    # anything still queued/processing — including results of items that already
+    # finished in that batch. Batches with nothing in flight are left untouched.
+    jobs_purge_queue_on_shutdown: bool = False
+    jobs_purge_queue_on_startup: bool = False
+
     @property
     def clamped_dead_cooldown_seconds(self) -> float:
         return min(self.dead_cooldown_seconds, HARD_MAX_COOLDOWN_SECONDS)

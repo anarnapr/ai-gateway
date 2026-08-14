@@ -25,6 +25,25 @@ from app.tracking.usage_logger import UsageLogger
 logger = logging.getLogger(__name__)
 
 
+async def _purge_queue(job_store: JobStore, phase: str) -> None:
+    """Best-effort wipe of every batch with anything queued/processing. Never allowed to
+    abort boot or shutdown — a dead Redis here is exactly the situation where the app
+    still needs to come up (or go down) cleanly.
+    """
+    try:
+        purged = await job_store.purge_pending()
+    except Exception:
+        logger.exception("Jobs queue purge on %s failed", phase)
+        return
+    if purged:
+        logger.warning(
+            "Jobs queue purged on %s: %d batch(es) dropped: %s",
+            phase, len(purged), ", ".join(purged),
+        )
+    else:
+        logger.info("Jobs queue purge on %s: nothing pending.", phase)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
@@ -88,6 +107,13 @@ async def lifespan(app: FastAPI):
         usage_logger=usage_logger,
         settings=settings,
     )
+    # Optional clean-slate boot. Must run BEFORE start(): the reaper does a boot sweep
+    # that requeues orphaned processing entries, so purging after would race it. This is
+    # the only purge point that survives a hard kill (SIGKILL/OOM), where the shutdown
+    # hook below never runs at all.
+    if settings.jobs_purge_queue_on_startup:
+        await _purge_queue(job_store, "startup")
+
     job_worker_pool.start()
     app.state.job_store = job_store
     app.state.job_worker_pool = job_worker_pool
@@ -101,6 +127,10 @@ async def lifespan(app: FastAPI):
 
     # Drain/cancel workers BEFORE closing Redis — requeueing in-flight items needs it.
     await job_worker_pool.stop()
+    # Purge after the drain, so items stop() just requeued are cleared too. Still before
+    # close_redis(), since purging needs Redis.
+    if settings.jobs_purge_queue_on_shutdown:
+        await _purge_queue(job_store, "shutdown")
     await close_redis()
 
 

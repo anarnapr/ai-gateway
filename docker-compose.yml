@@ -5,6 +5,11 @@ services:
       - "6379:6379"
     volumes:
       - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
 
   app:
     build: .
@@ -13,10 +18,16 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
       GEMINI_API_KEYS: ${GEMINI_API_KEYS:-}
+      # Clean slate across restarts: never resume batch work after a container stop.
+      # on_startup is the one that also covers hard kills (exit 137), where the
+      # shutdown hook never runs.
+      JOBS_PURGE_QUEUE_ON_SHUTDOWN: "true"
+      JOBS_PURGE_QUEUE_ON_STARTUP: "true"
     env_file:
       - .env
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     volumes:
       - ./tmp:/srv/tmp
 

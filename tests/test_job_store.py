@@ -234,3 +234,82 @@ async def test_purge_pending_only_touches_batches_with_inflight_work(store, fake
     assert await fake_redis.exists(redis_keys.jobs_batch(done_id)) == 1  # untouched
     assert await store.queue_length() == 0
     assert await fake_redis.lrange(redis_keys.jobs_processing(), 0, -1) == []
+
+
+# --- queue purge on container stop/start (app.main lifespan) ---------------------
+
+
+@pytest.mark.asyncio
+async def test_purge_queue_helper_drops_pending_batches(store, fake_redis, redis_keys):
+    from app.main import _purge_queue
+
+    batch_id, _ = await store.create_batch("gemini", _items(3))
+    assert await store.queue_length() == 3
+
+    await _purge_queue(store, "shutdown")
+
+    assert await store.queue_length() == 0
+    assert await fake_redis.exists(redis_keys.jobs_batch(batch_id)) == 0
+    assert await fake_redis.zscore(redis_keys.jobs_all_batches(), batch_id) is None
+
+
+@pytest.mark.asyncio
+async def test_purge_queue_helper_swallows_redis_errors(store, monkeypatch):
+    """A dead Redis must not abort boot or shutdown — that's exactly when the app
+    still has to come up (or go down) cleanly."""
+    from app.main import _purge_queue
+
+    async def _boom():
+        raise ConnectionError("redis is gone")
+
+    monkeypatch.setattr(store, "purge_pending", _boom)
+    await _purge_queue(store, "startup")  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_queue_survives_shutdown_when_purge_disabled(store, fake_redis, redis_keys):
+    """Durable queue is still the default: opting in is required, and with the flags
+    off the lifespan never calls _purge_queue, so enqueued work survives a restart.
+    Asserts the declared field defaults rather than a live Settings() — the deployed
+    compose file sets these env vars, so a live instance is environment-dependent.
+    """
+    from app.config import Settings
+
+    assert Settings.model_fields["jobs_purge_queue_on_shutdown"].default is False
+    assert Settings.model_fields["jobs_purge_queue_on_startup"].default is False
+
+    batch_id, _ = await store.create_batch("gemini", _items(2))
+    assert await store.queue_length() == 2
+    assert await fake_redis.exists(redis_keys.jobs_batch(batch_id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_purge_on_startup_clears_queue_left_by_a_hard_kill(
+    monkeypatch, tmp_path, fake_redis
+):
+    """Simulates exit 137: items are still in Redis from a killed container, and the
+    next boot starts clean because the shutdown hook never ran."""
+    import app.redis_client as redis_client_module
+    from app.config import get_settings
+
+    monkeypatch.setenv("GEMINI_API_KEYS", "key-aaaa1111")
+    monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.setenv("UPLOADS_DIR", str(tmp_path / "uploads"))
+    monkeypatch.setenv("JOBS_PURGE_QUEUE_ON_STARTUP", "true")
+    get_settings.cache_clear()
+    monkeypatch.setattr(redis_client_module, "_client", fake_redis)
+
+    settings = get_settings()
+    rk = RedisKeys(settings.redis_key_prefix)
+    orphan_store = JobStore(fake_redis, rk, settings)
+    batch_id, _ = await orphan_store.create_batch("gemini", _items(2))
+    assert await orphan_store.queue_length() == 2
+
+    from app.main import _purge_queue
+
+    assert settings.jobs_purge_queue_on_startup is True
+    await _purge_queue(orphan_store, "startup")
+
+    assert await orphan_store.queue_length() == 0
+    assert await fake_redis.exists(rk.jobs_batch(batch_id)) == 0
+    get_settings.cache_clear()
