@@ -120,11 +120,11 @@ class JobWorkerPool:
     def _item_dir(self, batch_id: str, item_id: str) -> Path:
         return Path(self.settings.uploads_dir) / "jobs" / batch_id / item_id
 
-    def _cleanup_media(self, batch_id: str, item_id: str) -> None:
+    async def _cleanup_media(self, batch_id: str, item_id: str) -> None:
         """Delete the per-item upload dir. Terminal outcomes only — never on
         requeue/cancel, the file(s) must survive for the retry. Safe to call even
         when the item had no media (nothing to remove, ignore_errors handles it)."""
-        shutil.rmtree(self._item_dir(batch_id, item_id), ignore_errors=True)
+        await asyncio.to_thread(shutil.rmtree, self._item_dir(batch_id, item_id), ignore_errors=True)
 
     async def _download_item_media(self, batch_id: str, item_id: str, media_urls: list[str]) -> list[str]:
         """Fetch every media_url for this item, one subdir per url so same-basename
@@ -134,7 +134,7 @@ class JobWorkerPool:
 
         async def _dl(index: int, url: str) -> str:
             dest_dir = base_dir / str(index)
-            dest_dir.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(dest_dir.mkdir, parents=True, exist_ok=True)
             path = await download_media(
                 url,
                 dest_dir,
@@ -162,7 +162,7 @@ class JobWorkerPool:
                 batch_id, item_id, entry, success=False,
                 error=f"Unknown provider '{req.provider}'", error_code="unknown_provider",
             )
-            self._cleanup_media(batch_id, item_id)
+            await self._cleanup_media(batch_id, item_id)
             return
 
         await self.store.mark_running(batch_id, item_id)
@@ -181,7 +181,7 @@ class JobWorkerPool:
                     batch_id, item_id, entry, success=False,
                     error=str(e), error_code="media_fetch_failed",
                 )
-                self._cleanup_media(batch_id, item_id)
+                await self._cleanup_media(batch_id, item_id)
                 return
 
         while True:
@@ -190,7 +190,7 @@ class JobWorkerPool:
                     batch_id, item_id, entry, success=False, cancelled=True,
                     error="Batch cancelled by client.", error_code="cancelled",
                 )
-                self._cleanup_media(batch_id, item_id)
+                await self._cleanup_media(batch_id, item_id)
                 return
 
             try:
@@ -219,7 +219,7 @@ class JobWorkerPool:
                         "attempts": attempts + 1,
                     },
                 )
-                self._cleanup_media(batch_id, item_id)
+                await self._cleanup_media(batch_id, item_id)
                 return
 
             except (PoolExhaustedHTTPError, AllKeysDeadHTTPError) as e:
@@ -233,7 +233,7 @@ class JobWorkerPool:
                         batch_id, item_id, entry, success=False,
                         error=e.detail, error_code=code,
                     )
-                    self._cleanup_media(batch_id, item_id)
+                    await self._cleanup_media(batch_id, item_id)
                     return
                 delay = min(
                     getattr(e, "retry_after_seconds", self.settings.jobs_retry_delay_seconds),
@@ -254,7 +254,7 @@ class JobWorkerPool:
                         batch_id, item_id, entry, success=False,
                         error=str(e), error_code="generate_failed",
                     )
-                    self._cleanup_media(batch_id, item_id)
+                    await self._cleanup_media(batch_id, item_id)
                     return
                 await self.store.refresh_lease(batch_id, item_id)
                 await self._wait_or_stop(self.settings.jobs_retry_delay_seconds)

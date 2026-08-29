@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from datetime import datetime, timezone
@@ -26,7 +27,7 @@ class UsageLogger:
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         return self.log_dir / f"calls-{day}.jsonl"
 
-    def log_call(
+    async def log_call(
         self,
         *,
         request_id: str,
@@ -59,10 +60,9 @@ class UsageLogger:
             "error": error,
             "latency_ms": latency_ms,
         }
-        with open(self._calls_file(), "a") as f:
-            f.write(json.dumps(entry, default=str) + "\n")
+        await asyncio.to_thread(self._write_line, self._calls_file(), entry)
 
-    def log_error(self, *, request_id: str, message: str, traceback_str: Optional[str] = None) -> None:
+    async def log_error(self, *, request_id: str, message: str, traceback_str: Optional[str] = None) -> None:
         day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -70,11 +70,19 @@ class UsageLogger:
             "message": message,
             "traceback": traceback_str,
         }
-        with open(self.log_dir / f"errors-{day}.log", "a") as f:
-            f.write(json.dumps(entry, default=str) + "\n")
+        await asyncio.to_thread(self._write_line, self.log_dir / f"errors-{day}.log", entry)
 
-    def log_full_payload(self, request_id: str, payload: dict[str, Any]) -> None:
+    async def log_full_payload(self, request_id: str, payload: dict[str, Any]) -> None:
         if not self.log_full_payloads:
             return
-        with open(self.requests_dir / f"{request_id}.json", "w") as f:
+        await asyncio.to_thread(self._write_json, self.requests_dir / f"{request_id}.json", payload)
+
+    @staticmethod
+    def _write_line(path: Path, entry: dict[str, Any]) -> None:
+        with open(path, "a") as f:
+            f.write(json.dumps(entry, default=str) + "\n")
+
+    @staticmethod
+    def _write_json(path: Path, payload: dict[str, Any]) -> None:
+        with open(path, "w") as f:
             json.dump(payload, f, indent=2, default=str)

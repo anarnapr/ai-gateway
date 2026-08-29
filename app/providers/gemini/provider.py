@@ -5,6 +5,7 @@ import base64
 import mimetypes
 import os
 import re
+import threading
 import time
 from typing import Optional, Union
 
@@ -36,6 +37,14 @@ class GeminiProvider(Provider):
         self._model_priority = model_priority
         self._model_aliases = model_aliases
         self._quota_table = quota_table
+        # One genai.Client per api_key, reused across generate/upload/delete instead of
+        # building a fresh one per call — each fresh client pays a new TCP+TLS handshake
+        # to Google, which is disproportionately expensive on a slow/high-latency link.
+        # genai.Client is safe to reuse across the asyncio.to_thread() worker threads
+        # that call into it (it holds no per-call mutable state beyond its own internal
+        # HTTP session, same pattern as reusing an httpx.Client / requests.Session).
+        self._clients: dict[str, genai.Client] = {}
+        self._clients_lock = threading.Lock()
 
     def model_priority(self) -> list[str]:
         return self._model_priority
@@ -53,10 +62,21 @@ class GeminiProvider(Provider):
         mime_type = mimetypes.guess_type(media_path)[0] or ""
         return "video" in mime_type or os.path.getsize(media_path) > 10 * 1024 * 1024
 
+    def _get_client(self, api_key: str) -> genai.Client:
+        client = self._clients.get(api_key)
+        if client is not None:
+            return client
+        with self._clients_lock:
+            client = self._clients.get(api_key)
+            if client is None:
+                client = genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
+                self._clients[api_key] = client
+            return client
+
     # ---------- media upload (File API) ----------
 
     def _upload_sync(self, media_path: str, api_key: str) -> UploadedMediaRef:
-        client = genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
+        client = self._get_client(api_key)
         base_filename = os.path.basename(media_path)
         sanitized_display_name = re.sub(r"\s*\(.*?\)|\s*\[.*?\]", "", base_filename).strip()
 
@@ -87,7 +107,7 @@ class GeminiProvider(Provider):
     async def delete_uploaded_media(self, ref: UploadedMediaRef, api_key: str) -> None:
         def _delete():
             try:
-                client = genai.Client(api_key=api_key, http_options={"api_version": "v1beta"})
+                client = self._get_client(api_key)
                 client.files.delete(name=ref.name)
             except Exception:
                 pass
@@ -120,7 +140,7 @@ class GeminiProvider(Provider):
     # ---------- generate ----------
 
     def _generate_sync(self, ctx: GenerateContext, content_to_send: list):
-        client = genai.Client(api_key=ctx.api_key, http_options={"api_version": "v1beta"})
+        client = self._get_client(ctx.api_key)
         return client.models.generate_content(model=ctx.model, contents=content_to_send)
 
     async def generate(self, ctx: GenerateContext) -> ProviderResult:

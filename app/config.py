@@ -129,6 +129,19 @@ class Settings(BaseSettings):
     def clamped_dead_cooldown_seconds(self) -> float:
         return min(self.dead_cooldown_seconds, HARD_MAX_COOLDOWN_SECONDS)
 
+    @property
+    def blocking_pool_max_workers(self) -> int:
+        # asyncio.to_thread() defaults to a process-wide ThreadPoolExecutor sized
+        # min(32, os.cpu_count()+4), shared by every blocking call this service makes:
+        # Gemini generate/upload/delete, media-download file writes, usage-log writes,
+        # job-worker cleanup. A slow network just means each thread is held longer
+        # (an upload can occupy one for up to ~780s) — enough concurrent slow calls
+        # exhaust that small default pool and queue out unrelated *fast* to_thread()
+        # calls behind them too. Size explicitly for worst-case concurrent demand
+        # (every job worker plus every sync in-flight slot, with headroom) instead of
+        # relying on the interpreter default.
+        return self.jobs_worker_concurrency + self.max_in_flight + 10
+
 
 @lru_cache
 def get_settings() -> Settings:

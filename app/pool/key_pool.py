@@ -71,8 +71,8 @@ class AsyncAPIKeyPool:
 
     # ---------- cooldown reads ----------
 
-    async def _read_cooldown(self, redis_key: str, now: float) -> float:
-        raw = await self.redis.get(redis_key)
+    @staticmethod
+    def _remaining_from_raw(raw: Any, now: float) -> float:
         if raw is None:
             return 0.0
         try:
@@ -81,8 +81,49 @@ class AsyncAPIKeyPool:
             return 0.0
         return max(until - now, 0.0)
 
+    async def _read_cooldown(self, redis_key: str, now: float) -> float:
+        raw = await self.redis.get(redis_key)
+        return self._remaining_from_raw(raw, now)
+
     async def _read_failure_meta(self, kid: str, model: str = "") -> dict[str, Any]:
         return await self.redis.hgetall(self.rk.failure_meta(kid, model))
+
+    async def _batch_get(self, redis_keys: list[str]) -> list[Any]:
+        if not redis_keys:
+            return []
+        pipe = self.redis.pipeline(transaction=False)
+        for rk in redis_keys:
+            pipe.get(rk)
+        return await pipe.execute()
+
+    async def _batch_exists(self, redis_keys: list[str]) -> list[Any]:
+        if not redis_keys:
+            return []
+        pipe = self.redis.pipeline(transaction=False)
+        for rk in redis_keys:
+            pipe.exists(rk)
+        return await pipe.execute()
+
+    async def _batch_hgetall(self, redis_keys: list[str]) -> list[dict[str, Any]]:
+        if not redis_keys:
+            return []
+        pipe = self.redis.pipeline(transaction=False)
+        for rk in redis_keys:
+            pipe.hgetall(rk)
+        return await pipe.execute()
+
+    async def _batch_effective_failure_meta(self, keys: list[str], model: str) -> dict[str, dict[str, Any]]:
+        """Pipelined equivalent of calling get_effective_failure_meta() once per key."""
+        if not keys:
+            return {}
+        kids = [key_id(k) for k in keys]
+        per_model = await self._batch_hgetall([self.rk.failure_meta(kid, model) for kid in kids])
+        needs_global = [kid for kid, meta in zip(kids, per_model) if not meta]
+        global_meta = await self._batch_hgetall([self.rk.failure_meta(kid) for kid in needs_global])
+        global_by_kid = dict(zip(needs_global, global_meta))
+        return {
+            kid: (meta or global_by_kid.get(kid, {})) for kid, meta in zip(kids, per_model)
+        }
 
     async def get_failure_meta(self, api_key: str, model: str = "") -> dict[str, Any]:
         return await self._read_failure_meta(key_id(api_key), model)
@@ -149,6 +190,123 @@ class AsyncAPIKeyPool:
 
         return KeyStatus.AVAILABLE.value, 0.0
 
+    async def _classify_keys_batch(
+        self,
+        keys: list[str],
+        model: str,
+        now: float,
+        tracker: Any = None,
+        service: str = "gemini",
+        method: str = "generate",
+        check_leased: bool = True,
+    ) -> dict[str, tuple[str, float]]:
+        """Pipelined equivalent of calling classify_key_status() once per key. Where
+        classify_key_status() pays up to ~6-7 sequential Redis round trips per key
+        (EXISTS leased, 2x GET cooldown, up to 2x HGETALL failure_meta, plus the
+        tracker's own calls), this collapses the cooldown/failure_meta reads for the
+        *whole key set* into a handful of pipelined round trips — this is what made
+        acquire_key() (called on every /v1/generate) the dominant latency cost on a
+        large key pool. Only the tracker.can_make_call()/get_retry_after_seconds()
+        calls remain per-key (CallTracker doesn't expose a pipelined batch form), but
+        those now run concurrently via asyncio.gather instead of one at a time.
+
+        check_leased=False skips the leased EXISTS check entirely — pass this when the
+        caller has already filtered to unleased keys (acquire_key's per-model loop
+        does this via its own gather), since re-checking here would just be redundant
+        round trips confirming something already known.
+        """
+        if not keys:
+            return {}
+        kids = [key_id(k) for k in keys]
+        by_kid = dict(zip(kids, keys))
+        result: dict[str, tuple[str, float]] = {}
+        candidates = kids
+
+        if check_leased:
+            leased_flags = await self._batch_exists([self.rk.leased(kid) for kid in kids])
+            candidates = [kid for kid, leased in zip(kids, leased_flags) if not leased]
+            for kid, leased in zip(kids, leased_flags):
+                if leased:
+                    result[kid] = (KeyStatus.IN_USE.value, 0.0)
+
+        if not candidates:
+            return result
+
+        global_raw = await self._batch_get([self.rk.cooldown_key(kid) for kid in candidates])
+        global_remaining = {kid: self._remaining_from_raw(raw, now) for kid, raw in zip(candidates, global_raw)}
+        globally_blocked = [kid for kid in candidates if global_remaining[kid] > 0]
+        global_meta_raw = await self._batch_hgetall([self.rk.failure_meta(kid) for kid in globally_blocked])
+        global_meta_by_kid = dict(zip(globally_blocked, global_meta_raw))
+
+        still_active = []
+        for kid in candidates:
+            remaining = global_remaining[kid]
+            if remaining <= 0:
+                still_active.append(kid)
+                continue
+            meta = global_meta_by_kid.get(kid, {})
+            if meta.get("reason") == FailureReason.AUTH_DEAD.value or remaining >= LONG_TERM_THRESHOLD_SECONDS:
+                result[kid] = (KeyStatus.DEAD_AUTH.value, remaining)
+            else:
+                result[kid] = (KeyStatus.SHORT_COOLDOWN.value, remaining)
+
+        if not still_active:
+            return result
+
+        keymodel_raw = await self._batch_get([self.rk.cooldown_keymodel(kid, model) for kid in still_active])
+        keymodel_remaining = {kid: self._remaining_from_raw(raw, now) for kid, raw in zip(still_active, keymodel_raw)}
+        keymodel_blocked = [kid for kid in still_active if keymodel_remaining[kid] > 0]
+        keymodel_meta_raw = await self._batch_hgetall(
+            [self.rk.failure_meta(kid, model) for kid in keymodel_blocked]
+        )
+        keymodel_meta_by_kid = dict(zip(keymodel_blocked, keymodel_meta_raw))
+
+        needs_tracker = []
+        for kid in still_active:
+            remaining = keymodel_remaining[kid]
+            if remaining <= 0:
+                needs_tracker.append(kid)
+                continue
+            meta = keymodel_meta_by_kid.get(kid, {})
+            reason = meta.get("reason", "")
+            if remaining >= LONG_TERM_THRESHOLD_SECONDS or reason in (
+                FailureReason.AUTH_DEAD.value,
+                FailureReason.QUOTA_EXHAUSTED.value,
+                FailureReason.NOT_FOUND.value,
+            ):
+                if reason == FailureReason.AUTH_DEAD.value:
+                    result[kid] = (KeyStatus.DEAD_AUTH.value, remaining)
+                else:
+                    result[kid] = (KeyStatus.DEAD_QUOTA.value, remaining)
+            elif reason == FailureReason.HIGH_DEMAND.value:
+                result[kid] = (KeyStatus.HIGH_DEMAND.value, remaining)
+            else:
+                result[kid] = (KeyStatus.RATE_LIMITED.value, remaining)
+
+        if not needs_tracker:
+            return result
+
+        if tracker is None:
+            for kid in needs_tracker:
+                result[kid] = (KeyStatus.AVAILABLE.value, 0.0)
+            return result
+
+        async def _check(kid: str) -> tuple[str, tuple[str, float]]:
+            api_key = by_kid[kid]
+            can_call, reason = await tracker.can_make_call(service, method, model, key_suffix(api_key))
+            if not can_call:
+                wait = await tracker.get_retry_after_seconds(service, method, model, key_suffix(api_key))
+                if wait >= LONG_TERM_THRESHOLD_SECONDS or "rpd" in reason.lower() or "daily" in reason.lower():
+                    return kid, (KeyStatus.DEAD_QUOTA.value, wait)
+                return kid, (KeyStatus.TRACKER_LIMITED.value, wait)
+            return kid, (KeyStatus.AVAILABLE.value, 0.0)
+
+        checked = await asyncio.gather(*(_check(kid) for kid in needs_tracker))
+        for kid, status_pair in checked:
+            result[kid] = status_pair
+
+        return result
+
     # ---------- model candidate selection ----------
 
     async def _get_candidate_models(self, now: float, pinned_model: Optional[str] = None) -> list[str]:
@@ -181,13 +339,17 @@ class AsyncAPIKeyPool:
 
         buckets: dict[str, list[dict[str, Any]]] = {status.value: [] for status in KeyStatus}
 
+        classified = await self._classify_keys_batch(self.api_keys, model_to_use, now, tracker, service, method)
+        meta_by_kid = await self._batch_effective_failure_meta(self.api_keys, model_to_use)
+
         for api_key in self.api_keys:
-            status, retry_in = await self.classify_key_status(api_key, model_to_use, now, tracker, service, method)
+            kid = key_id(api_key)
+            status, retry_in = classified.get(kid, (KeyStatus.AVAILABLE.value, 0.0))
             entry: dict[str, Any] = {
                 "suffix": key_suffix(api_key),
                 "retry_in_seconds": round(max(retry_in, 0.0), 1),
             }
-            meta = await self.get_effective_failure_meta(api_key, model_to_use)
+            meta = meta_by_kid.get(kid, {})
             if meta.get("reason"):
                 entry["last_reason"] = meta["reason"]
             if meta.get("streak"):
@@ -265,24 +427,34 @@ class AsyncAPIKeyPool:
                     best_wait = 1.0 if best_wait is None else min(best_wait, 1.0)
                     continue
 
+                classified = await self._classify_keys_batch(
+                    unleased_keys, model_to_use, now, tracker, service, method, check_leased=False
+                )
+
                 available_keys = []
                 model_retry_times = []
                 long_term_count = 0
+                possibly_available = []
 
                 for key in unleased_keys:
-                    status, retry_in = await self.classify_key_status(key, model_to_use, now, tracker, service, method)
+                    status, retry_in = classified.get(key_id(key), (KeyStatus.AVAILABLE.value, 0.0))
                     if status == KeyStatus.AVAILABLE.value:
-                        rpm_count = await self.redis.zcount(
-                            self.rk.usage_rpm(key_id(key), model_to_use), now - 60, "+inf"
-                        )
-                        if rpm_count < self.rpm:
-                            available_keys.append(key)
-                        else:
-                            model_retry_times.append(60.0)
+                        possibly_available.append(key)
                     elif status in (KeyStatus.DEAD_AUTH.value, KeyStatus.DEAD_QUOTA.value):
                         long_term_count += 1
                     elif retry_in > 0:
                         model_retry_times.append(retry_in)
+
+                if possibly_available:
+                    pipe = self.redis.pipeline(transaction=False)
+                    for key in possibly_available:
+                        pipe.zcount(self.rk.usage_rpm(key_id(key), model_to_use), now - 60, "+inf")
+                    rpm_counts = await pipe.execute()
+                    for key, rpm_count in zip(possibly_available, rpm_counts):
+                        if rpm_count < self.rpm:
+                            available_keys.append(key)
+                        else:
+                            model_retry_times.append(60.0)
 
                 if available_keys:
                     usage_counts = await asyncio.gather(
