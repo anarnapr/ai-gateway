@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import mimetypes
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -27,6 +29,11 @@ async def download_media(url: str, dest_dir: Path, *, max_bytes: int, timeout_se
     if parsed.scheme not in ("http", "https"):
         raise MediaDownloadError(f"Unsupported URL scheme: {parsed.scheme or '(none)'}")
 
+    # httpx's `timeout` float bounds each individual connect/read/write operation, not
+    # the transfer as a whole — a connection that trickles data in just under that
+    # limit on every chunk read would otherwise never time out even though the overall
+    # download can run indefinitely. Enforce a real wall-clock cap on top of that.
+    deadline = time.monotonic() + timeout_seconds
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=timeout_seconds) as client:
             async with client.stream("GET", url) as resp:
@@ -43,12 +50,16 @@ async def download_media(url: str, dest_dir: Path, *, max_bytes: int, timeout_se
                 written = 0
                 with open(dest_path, "wb") as f:
                     async for chunk in resp.aiter_bytes():
+                        if time.monotonic() > deadline:
+                            raise MediaDownloadError(
+                                f"media_url download exceeded {timeout_seconds}s overall"
+                            )
                         written += len(chunk)
                         if written > max_bytes:
                             raise MediaDownloadError(
                                 f"media_url body exceeds max_bytes ({max_bytes}) while streaming"
                             )
-                        f.write(chunk)
+                        await asyncio.to_thread(f.write, chunk)
 
                 if written == 0:
                     raise MediaDownloadError("media_url returned an empty body")

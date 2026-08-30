@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -50,6 +52,13 @@ async def lifespan(app: FastAPI):
     configure_logging(settings.log_dir)
     Path(settings.uploads_dir).mkdir(parents=True, exist_ok=True)
     Path(settings.log_dir).mkdir(parents=True, exist_ok=True)
+
+    # Explicitly sized so slow Gemini/media calls can't starve unrelated blocking
+    # work sharing the default executor (see Settings.blocking_pool_max_workers).
+    blocking_executor = ThreadPoolExecutor(
+        max_workers=settings.blocking_pool_max_workers, thread_name_prefix="blocking-pool"
+    )
+    asyncio.get_running_loop().set_default_executor(blocking_executor)
 
     redis_client = get_redis()
     rk = RedisKeys(settings.redis_key_prefix)
@@ -132,6 +141,7 @@ async def lifespan(app: FastAPI):
     if settings.jobs_purge_queue_on_shutdown:
         await _purge_queue(job_store, "shutdown")
     await close_redis()
+    blocking_executor.shutdown(wait=True)
 
 
 app = FastAPI(title="ai-gateway", version="0.1.0", lifespan=lifespan)
@@ -148,7 +158,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     logger.error("Unhandled exception on %s: %s\n%s", request.url.path, exc, tb)
     try:
         usage_logger: UsageLogger = request.app.state.usage_logger
-        usage_logger.log_error(request_id=request_id, message=str(exc), traceback_str=tb)
+        await usage_logger.log_error(request_id=request_id, message=str(exc), traceback_str=tb)
     except Exception:
         pass
     return JSONResponse(status_code=500, content={"error": "internal_error", "detail": str(exc)})

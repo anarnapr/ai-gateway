@@ -252,7 +252,7 @@ async def run_generate(
                             await pool.report_failure(
                                 key, attempt_model, classification, tracker=tracker, service=provider.name
                             )
-                            usage_logger.log_call(
+                            await usage_logger.log_call(
                                 request_id=request_id,
                                 service=provider.name,
                                 method="upload",
@@ -313,7 +313,7 @@ async def run_generate(
                     latency_ms=(time.monotonic() - start_time) * 1000,
                 )
                 await pool.record_success(key, attempt_model)
-                usage_logger.log_call(
+                await usage_logger.log_call(
                     request_id=request_id,
                     service=provider.name,
                     method="generate",
@@ -357,7 +357,7 @@ async def run_generate(
                     await pool.report_failure(
                         leased_key, attempt_model, classification, tracker=tracker, service=provider.name
                     )
-                    usage_logger.log_call(
+                    await usage_logger.log_call(
                         request_id=request_id,
                         service=provider.name,
                         method="generate",
